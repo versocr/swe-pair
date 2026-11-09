@@ -1,0 +1,496 @@
+diff --git a/docs/changelog/3822.bugfix.rst b/docs/changelog/3822.bugfix.rst
+new file mode 100644
+index 0000000000..811131c7a2
+--- /dev/null
++++ b/docs/changelog/3822.bugfix.rst
+@@ -0,0 +1 @@
++Allow glob patterns (``*``, ``?``) in ``depends`` configuration for ini files - by :user:`gaborbernat`.
+diff --git a/src/tox/config/loader/ini/__init__.py b/src/tox/config/loader/ini/__init__.py
+index 26d1b2f4e3..590738b7c7 100644
+--- a/src/tox/config/loader/ini/__init__.py
++++ b/src/tox/config/loader/ini/__init__.py
+@@ -22,7 +22,14 @@
+     from tox.config.main import Config
+ 
+ V = TypeVar("V")
+-_COMMENTS = re.compile(r"(\s)*(?<!\\)#.*")
++_COMMENTS = re.compile(
++    r"""
++    ( \s )*     # optional leading whitespace
++    (?<! \\ )   # not preceded by backslash
++    \# .*       # hash followed by anything
++    """,
++    re.VERBOSE,
++)
+ 
+ 
+ class IniLoader(StrConvert, Loader[str]):
+diff --git a/src/tox/config/loader/ini/factor.py b/src/tox/config/loader/ini/factor.py
+index 2000165882..90a173ded7 100644
+--- a/src/tox/config/loader/ini/factor.py
++++ b/src/tox/config/loader/ini/factor.py
+@@ -69,7 +69,14 @@ def explode_factor(group: list[tuple[str, bool]]) -> str:
+ def expand_factors(value: str) -> Iterator[tuple[list[list[tuple[str, bool]]] | None, str]]:
+     for line in value.split("\n"):
+         factors: list[list[tuple[str, bool]]] | None = None
+-        marker_search = re.search(r":(\s|$)", line)
++        marker_search = re.search(
++            r"""
++            :           # colon separator
++            ( \s | $ )  # followed by whitespace or end of string
++            """,
++            line,
++            re.VERBOSE,
++        )
+         marker_at, content = marker_search.start() if marker_search else -1, line
+         if marker_at != -1:
+             try:
+@@ -89,15 +96,45 @@ def find_factor_groups(value: str) -> Iterator[list[tuple[str, bool]]]:
+         yield result
+ 
+ 
+-_FACTOR_RE = re.compile(r"(?:!?[\w._][\w._-]*|^$)")
++_FACTOR_RE = re.compile(
++    r"""
++    (?:
++        !?              # optional negation prefix
++        [\w.*?]         # first char: word char, dot, or glob wildcards
++        [\w.*?-]*       # remaining chars: word chars, dots, glob wildcards, or hyphens
++    |
++        ^$              # or an empty string
++    )
++    """,
++    re.VERBOSE,
++)
+ 
+ 
+ def expand_env_with_negation(value: str) -> Iterator[str]:
+     """Transform '{py,!pi}-{a,b},c' to ['py-a', 'py-b', '!pi-a', '!pi-b', 'c']."""
+-    for key, group in groupby(re.split(r"((?:{[^}]+})+)|,", value), key=bool):
++    for key, group in groupby(
++        re.split(
++            r"""
++            ( (?: \{ [^}]+ \} )+ )  # one or more brace groups
++            |                        # or
++            ,                        # comma separator
++            """,
++            value,
++            flags=re.VERBOSE,
++        ),
++        key=bool,
++    ):
+         if key:
+             group_str = "".join(group).strip()
+-            elements = re.split(r"{([^}]+)}", group_str)
++            elements = re.split(
++                r"""
++                \{          # opening brace
++                ( [^}]+ )   # capture contents
++                \}          # closing brace
++                """,
++                group_str,
++                flags=re.VERBOSE,
++            )
+             parts = [[i.strip() for i in elem.split(",")] for elem in elements]
+             for variant in product(*parts):
+                 variant_str = "".join(variant)
+@@ -123,7 +160,22 @@ def expand_ranges(value: str) -> str:
+     left-open ``{-13}`` (lower bound = :data:`LATEST_PYTHON_MINOR_MIN`).
+ 
+     """
+-    matches = re.findall(r"((\d+)-(\d+)|(\d+)-|(?<=[{,])-(\d+)|\d+)(?:,|})", value)
++    matches = re.findall(
++        r"""
++        (                       # outer capture group
++            ( \d+ ) - ( \d+ )   # closed range: start-end
++            |
++            ( \d+ ) -           # right-open range: start-
++            |
++            (?<= [{,] ) - ( \d+ )  # left-open range: -end (preceded by { or ,)
++            |
++            \d+                 # single number
++        )
++        (?: , | \} )            # followed by comma or closing brace
++        """,
++        value,
++        re.VERBOSE,
++    )
+     for src, start_, end_, open_start, open_end in matches:
+         if src and start_ and end_:
+             start, end = int(start_), int(end_)
+diff --git a/src/tox/session/env_select.py b/src/tox/session/env_select.py
+index 6696b6da97..e17780abf7 100644
+--- a/src/tox/session/env_select.py
++++ b/src/tox/session/env_select.py
+@@ -200,8 +200,29 @@ class _ToxEnvInfo:
+     runner_unavailable: str | None = None  #: if set the runner is not available (contains runner name)
+ 
+ 
+-_DYNAMIC_ENV_FACTORS = re.compile(r"(pypy|py|cython|)(((\d(\.\d+(\.\d+)?)?)|\d+)t?)?")
+-_PY_PRE_RELEASE_FACTOR = re.compile(r"alpha|beta|rc\.\d+")
++_DYNAMIC_ENV_FACTORS = re.compile(
++    r"""
++    ( pypy | py | cython | )        # interpreter prefix (or empty)
++    (                                # version group
++        (
++            ( \d                     # major digit
++                ( \. \d+ ( \. \d+ )? )?  # optional minor.patch
++            )
++            | \d+                    # or just digits
++        )
++        t?                           # optional free-threaded suffix
++    )?
++    """,
++    re.VERBOSE,
++)
++_PY_PRE_RELEASE_FACTOR = re.compile(
++    r"""
++    alpha       # alpha release
++    | beta      # beta release
++    | rc \. \d+ # release candidate with number
++    """,
++    re.VERBOSE,
++)
+ 
+ 
+ class EnvSelector:
+diff --git a/src/tox/tox_env/api.py b/src/tox/tox_env/api.py
+index 477c51fd3e..36e44c2080 100644
+--- a/src/tox/tox_env/api.py
++++ b/src/tox/tox_env/api.py
+@@ -48,7 +48,14 @@
+     "secret",
+     "token",
+ ]
+-SECRET_ENV_VAR_REGEX = re.compile(".*(" + "|".join(SECRET_KEYWORDS) + ").*", re.IGNORECASE)
++SECRET_ENV_VAR_REGEX = re.compile(
++    r"""
++    .*                  # any prefix
++    ( {keywords} )      # one of the secret keywords
++    .*                  # any suffix
++    """.format(keywords="|".join(SECRET_KEYWORDS)),
++    re.VERBOSE | re.IGNORECASE,
++)
+ 
+ 
+ def redact_value(name: str, value: str) -> str:
+diff --git a/src/tox/tox_env/python/api.py b/src/tox/tox_env/python/api.py
+index dc9a02e33d..a517ca4e0d 100644
+--- a/src/tox/tox_env/python/api.py
++++ b/src/tox/tox_env/python/api.py
+@@ -63,7 +63,16 @@ def version_dot(self) -> str:
+     """,
+     re.VERBOSE,
+ )
+-PY_FACTORS_RE_EXPLICIT_VERSION = re.compile(r"^((?P<impl>cpython|pypy)-)?(?P<version>[2-9]\.[0-9]+)(?P<threaded>t?)$")
++PY_FACTORS_RE_EXPLICIT_VERSION = re.compile(
++    r"""
++    ^
++    ( (?P<impl> cpython | pypy ) - )?   # optional interpreter prefix with dash
++    (?P<version> [2-9] \. [0-9]+ )      # explicit major.minor version
++    (?P<threaded> t? )                   # optional free-threaded suffix
++    $
++    """,
++    re.VERBOSE,
++)
+ 
+ 
+ class Python(ToxEnv, ABC):
+diff --git a/src/tox/tox_env/python/pip/req/args.py b/src/tox/tox_env/python/pip/req/args.py
+index 70cad12323..81f5f113b9 100644
+--- a/src/tox/tox_env/python/pip/req/args.py
++++ b/src/tox/tox_env/python/pip/req/args.py
+@@ -64,7 +64,17 @@ def _req_options(parser: ArgumentParser) -> None:
+     parser.add_argument("--hash", action=AddSortedUniqueAction, type=_validate_hash)
+ 
+ 
+-_HASH = re.compile(r"sha(256:[a-f0-9]{64}|384:[a-f0-9]{96}|512:[a-f0-9]{128})")
++_HASH = re.compile(
++    r"""
++    sha
++    (
++        256 : [a-f0-9]{64}      # SHA-256 hash
++        | 384 : [a-f0-9]{96}    # SHA-384 hash
++        | 512 : [a-f0-9]{128}   # SHA-512 hash
++    )
++    """,
++    re.VERBOSE,
++)
+ 
+ 
+ def _validate_hash(value: str) -> str:
+diff --git a/src/tox/tox_env/python/pip/req/file.py b/src/tox/tox_env/python/pip/req/file.py
+index 4f73c1c2ba..842e9ebc2e 100644
+--- a/src/tox/tox_env/python/pip/req/file.py
++++ b/src/tox/tox_env/python/pip/req/file.py
+@@ -22,8 +22,24 @@
+ 
+ # Matches environment variable-style values in '${MY_VARIABLE_1}' with the variable name consisting of only uppercase
+ # letters, digits or the '_' (underscore). This follows the POSIX standard defined in IEEE Std 1003.1, 2013 Edition.
+-_ENV_VAR_RE = re.compile(r"(?P<var>\${(?P<name>[A-Z0-9_]+)})")
+-_SCHEME_RE = re.compile(r"^(http|https|file):", re.IGNORECASE)
++_ENV_VAR_RE = re.compile(
++    r"""
++    (?P<var>
++        \$ \{               # dollar sign and opening brace
++        (?P<name> [A-Z0-9_]+ )  # POSIX variable name
++        \}                  # closing brace
++    )
++    """,
++    re.VERBOSE,
++)
++_SCHEME_RE = re.compile(
++    r"""
++    ^                       # start of string
++    ( http | https | file ) # URL scheme
++    :                       # colon
++    """,
++    re.VERBOSE | re.IGNORECASE,
++)
+ _BOMS: tuple[tuple[bytes, str], ...] = (
+     (codecs.BOM_UTF8, "utf-8"),
+     (codecs.BOM_UTF32_BE, "utf-32-be"),
+@@ -31,11 +47,37 @@
+     (codecs.BOM_UTF16_BE, "utf-16-be"),
+     (codecs.BOM_UTF16_LE, "utf-16-le"),
+ )
+-_COMMENT_RE = re.compile(r"(^|\s+)#.*$")
+-# https://www.python.org/dev/peps/pep-0508/#extras
+-_EXTRA_PATH = re.compile(r"(.*)\[([-._,\sa-zA-Z0-9]*)]")
+-_EXTRA_ELEMENT = re.compile(r"[a-zA-Z0-9]*[-._a-zA-Z0-9]")
+-_VERSION_SPECIFIER = re.compile(r"[><=!~]=|===?|[><]")
++_COMMENT_RE = re.compile(
++    r"""
++    ( ^ | \s+ )    # start of string or whitespace
++    \# .* $        # hash followed by anything to end
++    """,
++    re.VERBOSE,
++)
++_EXTRA_PATH = re.compile(
++    r"""
++    ( .* )                          # path portion
++    \[                              # opening bracket
++    ( [-._,\s a-zA-Z0-9]* )        # extras list
++    ]                               # closing bracket
++    """,
++    re.VERBOSE,
++)
++_EXTRA_ELEMENT = re.compile(
++    r"""
++    [a-zA-Z0-9]*       # optional leading alphanumeric
++    [-._a-zA-Z0-9]     # at least one valid extra char
++    """,
++    re.VERBOSE,
++)
++_VERSION_SPECIFIER = re.compile(
++    r"""
++    [><=!~] =   # two-char operators: >=, <=, ==, !=, ~=
++    | ===?      # === or ==
++    | [><]      # single-char operators: > or <
++    """,
++    re.VERBOSE,
++)
+ ReqFileLines = Iterator[tuple[int, str]]
+ 
+ DEFAULT_INDEX_URL = "https://pypi.org/simple"
+diff --git a/src/tox/tox_env/python/pip/req_file.py b/src/tox/tox_env/python/pip/req_file.py
+index f00538cdd5..5f312f8223 100644
+--- a/src/tox/tox_env/python/pip/req_file.py
++++ b/src/tox/tox_env/python/pip/req_file.py
+@@ -7,6 +7,14 @@
+ 
+ from .req.file import ParsedRequirement, ReqFileLines, RequirementsFile
+ 
++_UNESCAPED_SPACE_RE = re.compile(
++    r"""
++    (?<! \\ )   # not preceded by backslash
++    ( \s )      # capture whitespace
++    """,
++    re.VERBOSE,
++)
++
+ if TYPE_CHECKING:
+     from argparse import ArgumentParser, Namespace
+     from pathlib import Path
+@@ -93,7 +101,7 @@ def _normalize_line(cls, line: str) -> str:
+         escape_match = next((e for e in ONE_ARG_ESCAPE if line.startswith(e) and line[len(e)].isspace()), None)
+         if escape_match is not None:
+             # escape not already escaped spaces
+-            escaped = re.sub(r"(?<!\\)(\s)", r"\\\1", line[len(escape_match) + 1 :])
++            escaped = _UNESCAPED_SPACE_RE.sub(r"\\\1", line[len(escape_match) + 1 :])
+             line = f"{line[: len(escape_match)]} {escaped}"
+         return line
+ 
+@@ -205,7 +213,7 @@ def _normalize_line(cls, line: str) -> str:
+         escape_match = next((e for e in ONE_ARG_ESCAPE if line.startswith(e) and line[len(e)].isspace()), None)
+         if escape_match is not None:
+             # escape not already escaped spaces
+-            escaped = re.sub(r"(?<!\\)(\s)", r"\\\1", line[len(escape_match) + 1 :])
++            escaped = _UNESCAPED_SPACE_RE.sub(r"\\\1", line[len(escape_match) + 1 :])
+             line = f"{line[: len(escape_match)]} {escaped}"
+         return line
+ 
+diff --git a/src/tox/tox_env/runner.py b/src/tox/tox_env/runner.py
+index a464afb266..7bc839c230 100644
+--- a/src/tox/tox_env/runner.py
++++ b/src/tox/tox_env/runner.py
+@@ -30,7 +30,14 @@ def __init__(self, create_args: ToxEnvCreateArgs) -> None:
+ 
+     def register_config(self) -> None:
+         def ensure_one_line(value: str) -> str:
+-            return re.sub(r"\s+", " ", value.replace("\r", "").replace("\n", " "))
++            return re.sub(
++                r"""
++                \s+     # one or more whitespace characters
++                """,
++                " ",
++                value.replace("\r", "").replace("\n", " "),
++                flags=re.VERBOSE,
++            )
+ 
+         self.conf.add_config(
+             keys=["description"],
+diff --git a/docs/changelog/3831.feature.rst b/docs/changelog/3831.feature.rst
+new file mode 100644
+index 0000000000..ec76d359aa
+--- /dev/null
++++ b/docs/changelog/3831.feature.rst
+@@ -0,0 +1,2 @@
++Show clean error messages instead of stack traces when TOML configuration contains type mismatches (e.g., ``deps =
++[1]``), wrapping failures in ``HandledError`` with environment and key context - by :user:`gaborbernat`.
+diff --git a/src/tox/config/loader/memory.py b/src/tox/config/loader/memory.py
+index 6e2ac4df21..cc521760e0 100644
+--- a/src/tox/config/loader/memory.py
++++ b/src/tox/config/loader/memory.py
+@@ -58,7 +58,8 @@ def to_command(value: Any) -> Command | None:
+             return value
+         if isinstance(value, str):
+             return StrConvert.to_command(value)
+-        raise TypeError(value)
++        msg = f"command expected Command or str, got {type(value).__name__}: {value!r}"
++        raise TypeError(msg)
+ 
+     @staticmethod
+     def to_env_list(value: Any) -> EnvList:
+@@ -66,4 +67,5 @@ def to_env_list(value: Any) -> EnvList:
+             return value
+         if isinstance(value, str):
+             return StrConvert.to_env_list(value)
+-        raise TypeError(value)
++        msg = f"env_list expected EnvList or str, got {type(value).__name__}: {value!r}"
++        raise TypeError(msg)
+diff --git a/src/tox/config/loader/toml/__init__.py b/src/tox/config/loader/toml/__init__.py
+index dac45ac785..c31528553f 100644
+--- a/src/tox/config/loader/toml/__init__.py
++++ b/src/tox/config/loader/toml/__init__.py
+@@ -6,7 +6,7 @@
+ from typing import TYPE_CHECKING, Any, TypeVar, cast
+ 
+ from tox.config.loader.api import ConfigLoadArgs, Loader, Override
+-from tox.config.loader.replacer import replace
++from tox.config.loader.replacer import MatchError, replace
+ from tox.config.set_env import SetEnv
+ from tox.config.types import Command, EnvList
+ from tox.report import HandledError
+@@ -62,7 +62,7 @@ def load_raw_from_root(self, path: str) -> TomlTypes:
+ 
+     def build(  # noqa: PLR0913
+         self,
+-        key: str,  # noqa: ARG002
++        key: str,
+         of_type: type[_T] | UnionType,
+         factory: Factory[_T],
+         conf: Config | None,
+@@ -70,9 +70,16 @@ def build(  # noqa: PLR0913
+         args: ConfigLoadArgs,
+     ) -> _T:
+         delay_replace = inspect.isclass(of_type) and issubclass(of_type, SetEnv)
+-        unroll = Unroll(conf=conf, loader=self, args=args)
+-        exploded = unroll(raw, skip_str=True) if delay_replace else unroll(raw)
+-        result = self.to(exploded, of_type, factory)
++        try:
++            unroll = Unroll(conf=conf, loader=self, args=args)
++            exploded = unroll(raw, skip_str=True) if delay_replace else unroll(raw)
++            result = self.to(exploded, of_type, factory)
++        except (HandledError, MatchError):
++            raise
++        except Exception as exception:
++            name = "core" if args.env_name is None else args.env_name
++            msg = f"failed to load {name}.{key}: {exception}"
++            raise HandledError(msg) from exception
+         if delay_replace:
+             loader = self
+ 
+diff --git a/src/tox/config/sets.py b/src/tox/config/sets.py
+index bb92e0a746..c6c7733d55 100644
+--- a/src/tox/config/sets.py
++++ b/src/tox/config/sets.py
+@@ -287,7 +287,10 @@ def is_valid_value(v: object) -> bool:
+                     )
+                 )
+             ):
+-                raise TypeError(raw)
++                msg = (
++                    f"set_env expected str, dict[str, str], or list[dict[str, str]], got {type(raw).__name__}: {raw!r}"
++                )
++                raise TypeError(msg)
+             return SetEnv(cast("SetEnvRaw", raw), self.name, self.env_name, root)
+ 
+         root = self._conf.core["tox_root"]
+diff --git a/src/tox/session/cmd/run/single.py b/src/tox/session/cmd/run/single.py
+index f2ba87d7b2..ed869cfd84 100644
+--- a/src/tox/session/cmd/run/single.py
++++ b/src/tox/session/cmd/run/single.py
+@@ -7,6 +7,7 @@
+ from typing import TYPE_CHECKING, NamedTuple, cast
+ 
+ from tox.execute.api import Outcome, StdinSource
++from tox.report import HandledError
+ from tox.tox_env.errors import Fail, Skip
+ from tox.tox_env.python.virtual_env.package.pyproject import ToxBackendFailed
+ 
+@@ -60,6 +61,9 @@ def _evaluate(tox_env: RunToxEnv, no_test: bool) -> tuple[bool, int, list[Outcom
+         except Fail as exception:
+             LOGGER.error("failed with %s", exception)  # noqa: TRY400
+             code = 1
++        except HandledError as exception:
++            LOGGER.error("%s", exception)  # noqa: TRY400
++            code = 1
+         except Exception:  # pragma: no cover
+             LOGGER.exception("internal error")  # pragma: no cover
+             code = 2  # pragma: no cover
+diff --git a/src/tox/tox_env/python/pip/req_file.py b/src/tox/tox_env/python/pip/req_file.py
+index 5f312f8223..84a8bcef12 100644
+--- a/src/tox/tox_env/python/pip/req_file.py
++++ b/src/tox/tox_env/python/pip/req_file.py
+@@ -142,7 +142,7 @@ def factory(cls, root: Path, raw: object) -> PythonDeps:
+                 and (all(isinstance(i, str) for i in raw) or all(isinstance(i, Requirement) for i in raw))
+             )
+         ):
+-            raise TypeError(raw)
++            raise TypeError(_factory_type_error("deps", raw))
+         return cls(cast("str | list[str] | list[Requirement]", raw), root)
+ 
+ 
+@@ -249,10 +249,20 @@ def factory(cls, root: Path, raw: object) -> PythonConstraints:
+                 and (all(isinstance(i, str) for i in raw) or all(isinstance(i, Requirement) for i in raw))
+             )
+         ):
+-            raise TypeError(raw)
++            raise TypeError(_factory_type_error("constraints", raw))
+         return cls(cast("str | list[str] | list[Requirement]", raw), root)
+ 
+ 
++def _factory_type_error(field: str, raw: object) -> str:
++    expected = "str, list[str], or list[Requirement]"
++    if isinstance(raw, list):
++        bad_items = ", ".join(
++            f"[{i}] {type(item).__name__}" for i, item in enumerate(raw) if not isinstance(item, (str, Requirement))
++        )
++        return f"{field} expected {expected}, got list with invalid items: {bad_items}"
++    return f"{field} expected {expected}, got {type(raw).__name__}: {raw!r}"
++
++
+ ONE_ARG = {
+     "-i",
+     "--index-url",

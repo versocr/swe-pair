@@ -1,0 +1,596 @@
+diff --git a/bridge/__init__.py b/bridge/__init__.py
+new file mode 100644
+index 0000000..b241217
+--- /dev/null
++++ b/bridge/__init__.py
+@@ -0,0 +1 @@
++"""Bridge infrastructure: logging, configuration, and shared utilities."""
+diff --git a/bridge/logging_config.py b/bridge/logging_config.py
+new file mode 100644
+index 0000000..7aa29ae
+--- /dev/null
++++ b/bridge/logging_config.py
+@@ -0,0 +1,116 @@
++"""Centralized logging configuration for the xAI bridge.
++
++Configurable via environment variables:
++  LOG_LEVEL     - Root log level (default: INFO). Options: DEBUG, INFO, WARNING, ERROR.
++  DUMP_REQUESTS - Write full request/response JSON to files (default: false).
++  DUMP_DIR      - Directory for request dumps (default: ./dumps).
++
++Logger hierarchy:
++  bridge.main       - Application lifecycle and HTTP layer
++  bridge.forward    - Anthropic-to-OpenAI translation
++  bridge.reverse    - OpenAI-to-Anthropic translation
++  bridge.enrichment - Tool enrichment pipeline
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import time
++from pathlib import Path
++from typing import Any
++
++
++_LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
++_configured = False
++
++
++def configure_logging() -> None:
++    """Set up structured logging from environment variables.
++
++    Safe to call multiple times; only configures once.
++    """
++    global _configured
++    if _configured:
++        return
++
++    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
++    level = getattr(logging, level_name, logging.INFO)
++
++    logging.basicConfig(format=_LOG_FORMAT, level=level, force=True)
++
++    # Set bridge loggers to the configured level
++    for name in ("bridge.main", "bridge.forward", "bridge.reverse", "bridge.enrichment"):
++        logging.getLogger(name).setLevel(level)
++
++    # Quiet noisy third-party loggers at INFO
++    for lib in ("httpx", "httpcore", "uvicorn.access"):
++        logging.getLogger(lib).setLevel(max(level, logging.WARNING))
++
++    _configured = True
++
++
++def get_logger(module: str) -> logging.Logger:
++    """Return a logger in the bridge hierarchy.
++
++    Args:
++        module: One of 'main', 'forward', 'reverse', 'enrichment'.
++    """
++    return logging.getLogger(f"bridge.{module}")
++
++
++def is_dump_enabled() -> bool:
++    """Check if request/response dumping is enabled."""
++    return os.getenv("DUMP_REQUESTS", "false").lower() in ("true", "1", "yes")
++
++
++def get_dump_dir() -> Path:
++    """Return the dump directory path, creating it if needed."""
++    dump_dir = Path(os.getenv("DUMP_DIR", "./dumps"))
++    dump_dir.mkdir(parents=True, exist_ok=True)
++    return dump_dir
++
++
++def dump_json(label: str, data: dict[str, Any]) -> Path | None:
++    """Write a JSON payload to the dump directory.
++
++    Args:
++        label: Prefix for the filename (e.g., 'request', 'response').
++        data: The payload to dump.
++
++    Returns:
++        Path to the written file, or None if dumping is disabled.
++    """
++    if not is_dump_enabled():
++        return None
++
++    dump_dir = get_dump_dir()
++    ts = int(time.time() * 1000)
++    path = dump_dir / f"{label}_{ts}.json"
++    path.write_text(json.dumps(data, indent=2, default=str))
++    return path
++
++
++def sanitize_request(payload: dict[str, Any]) -> dict[str, Any]:
++    """Remove sensitive fields from a request payload for logging.
++
++    Strips Authorization headers and API keys. Returns a shallow copy
++    with sensitive values replaced by '[REDACTED]'.
++    """
++    sanitized = dict(payload)
++
++    # Strip top-level keys that might contain secrets
++    for key in ("api_key", "authorization", "Authorization"):
++        if key in sanitized:
++            sanitized[key] = "[REDACTED]"
++
++    # Strip from nested headers dict
++    headers = sanitized.get("headers")
++    if isinstance(headers, dict):
++        sanitized["headers"] = {
++            k: "[REDACTED]" if k.lower() in ("authorization", "x-api-key") else v
++            for k, v in headers.items()
++        }
++
++    return sanitized
+diff --git a/enrichment/engine.py b/enrichment/engine.py
+index ab1c81b..f801f7b 100644
+--- a/enrichment/engine.py
++++ b/enrichment/engine.py
+@@ -5,18 +5,22 @@
+ the bridge a universal upgrade layer rather than just a format translator.
+ 
+ Architecture:
+-  Layer 1 — Structural: Independent pattern applicators from the API standard
+-  Layer 2 — Behavioral: WHAT/WHY/WHEN knowledge from Claude Code's training
++  Layer 1 -- Structural: Independent pattern applicators from the API standard
++  Layer 2 -- Behavioral: WHAT/WHY/WHEN knowledge from Claude Code's training
+ 
+ Both layers are composable and configurable via EnrichmentConfig.
+ """
+ import copy
++import json
+ from typing import Any
+ 
++from bridge.logging_config import get_logger
+ from enrichment.config import EnrichmentConfig
+ from enrichment.structural.base import PatternApplicator
+ from enrichment.behavioral.base import BehavioralEnricher
+ 
++logger = get_logger("enrichment")
++
+ 
+ class ToolEnricher:
+     """Pipeline orchestrator for tool enrichment.
+@@ -38,25 +42,66 @@ def __init__(
+     def enrich(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+         """Apply all enabled enrichment layers to tool definitions.
+ 
+-        Returns a new list — never modifies the input.
++        Returns a new list -- never modifies the input.
+         """
++        tool_names = [t.get("name", "?") for t in tools]
++
+         if self.config.is_passthrough:
++            logger.debug("Enrichment skipped (passthrough mode) tools=%s", tool_names)
+             return tools
+ 
++        # -- Point 1: Tool count + names at INFO --
++        logger.info(
++            "Enriching %d tools mode=%s names=%s",
++            len(tools), self.config.mode, tool_names,
++        )
++
+         # Deep copy to avoid mutation
+         enriched = copy.deepcopy(tools)
++        applied_patterns: list[str] = []
+ 
+         # Layer 1: Structural patterns (API standard)
+         for pattern in self.structural_patterns:
+             if pattern.pattern_number in self.config.enabled_structural:
+                 enriched = pattern.apply(enriched)
++                applied_patterns.append(
++                    f"P{pattern.pattern_number}:{pattern.__class__.__name__}"
++                )
+ 
+         # Layer 2: Behavioral enrichment (training transfer)
++        behavioral_applied: list[str] = []
+         if self.config.include_behavioral:
+             for i, tool in enumerate(enriched):
+                 for enricher in self.behavioral_enrichers:
+                     if self._should_apply_behavioral(enricher):
+                         enriched[i] = enricher.enrich(enriched[i])
++                        if enricher.dimension not in behavioral_applied:
++                            behavioral_applied.append(enricher.dimension)
++
++        # -- Point 4: Enrichment pipeline details at DEBUG --
++        logger.debug(
++            "Enrichment complete: mode=%s structural_patterns=%s "
++            "behavioral_dimensions=%s tools_in=%d tools_out=%d",
++            self.config.mode, applied_patterns, behavioral_applied,
++            len(tools), len(enriched),
++        )
++
++        # -- Point 1: Per-tool field diff at DEBUG --
++        for i, (orig, enriched_tool) in enumerate(zip(tools, enriched)):
++            orig_keys = set(orig.keys())
++            enriched_keys = set(enriched_tool.keys())
++            added = enriched_keys - orig_keys
++            if added:
++                logger.debug(
++                    "Tool '%s' fields added: %s",
++                    enriched_tool.get("name", f"[{i}]"), sorted(added),
++                )
++
++        # Full enriched definitions at DEBUG
++        logger.debug(
++            "Enriched tool definitions: %s",
++            json.dumps(enriched, indent=2, default=str),
++        )
+ 
+         return enriched
+ 
+diff --git a/main.py b/main.py
+index 4946610..dc0242b 100644
+--- a/main.py
++++ b/main.py
+@@ -11,9 +11,9 @@
+ import os
+ import json
+ import time
+-import logging
+ from dotenv import load_dotenv
+ 
++from bridge.logging_config import configure_logging, get_logger, dump_json, sanitize_request
+ from translation.forward import anthropic_to_openai, strip_thinking
+ from translation.reverse import translate_response
+ from translation.streaming import OpenAIToAnthropicStreamAdapter
+@@ -21,7 +21,8 @@
+ from enrichment.factory import create_enricher
+ 
+ load_dotenv()
+-logger = logging.getLogger(__name__)
++configure_logging()
++logger = get_logger("main")
+ 
+ app = FastAPI(title="xai-agentic-claude-bridge")
+ XAI_API_KEY = os.getenv("XAI_API_KEY", "")
+@@ -54,6 +55,17 @@ async def health() -> dict:
+ async def messages(request: Request):
+     body = await request.json()
+     start = time.time()
++
++    # -- Point 2: Outgoing request summary (INFO) --
++    msg_count = len(body.get("messages", []))
++    tool_count = len(body.get("tools", []) or [])
++    has_thinking = "thinking" in body
++    is_stream = bool(body.get("stream"))
++    logger.info(
++        "POST /v1/messages model=%s messages=%d tools=%d thinking=%s stream=%s",
++        body.get("model", "?"), msg_count, tool_count, has_thinking, is_stream,
++    )
++
+     try:
+         bridge_warnings = strip_thinking(body)
+         if bridge_warnings:
+@@ -61,14 +73,43 @@ async def messages(request: Request):
+                 logger.info("Degraded feature: %s", w)
+ 
+         openai_body = anthropic_to_openai(body)
++
++        # -- Point 2: Full translated payload at DEBUG --
++        logger.debug(
++            "Translated request: %s",
++            json.dumps(sanitize_request(openai_body), default=str),
++        )
++        dump_json("request", sanitize_request(openai_body))
++
+         headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
+ 
+         if openai_body.get("stream"):
+-            return await _stream(openai_body, headers, bridge_warnings)
++            return await _stream(openai_body, headers, bridge_warnings, start)
+ 
+         resp = await client.post("/chat/completions", json=openai_body, headers=headers)
+         data = resp.json()
+-        logger.info("xAI response in %.2fs (status=%d)", time.time() - start, resp.status_code)
++        elapsed = time.time() - start
++
++        # -- Point 3: Response summary (INFO) --
++        usage = data.get("usage", {})
++        choices = data.get("choices", [])
++        stop_reason = choices[0].get("finish_reason", "?") if choices else "?"
++        tool_calls_count = len(
++            (choices[0].get("message", {}).get("tool_calls") or []) if choices else []
++        )
++        logger.info(
++            "xAI response in %.2fs status=%d stop=%s tool_calls=%d "
++            "tokens=%d/%d/%d",
++            elapsed, resp.status_code, stop_reason, tool_calls_count,
++            usage.get("prompt_tokens", 0),
++            usage.get("completion_tokens", 0),
++            usage.get("total_tokens", 0),
++        )
++
++        # -- Point 3: Full response at DEBUG --
++        logger.debug("xAI response body: %s", json.dumps(data, default=str))
++        dump_json("response", data)
++
+         result = translate_response(data, status_code=resp.status_code)
+ 
+         if resp.status_code != 200:
+@@ -80,6 +121,7 @@ async def messages(request: Request):
+         return JSONResponse(content=result, headers=response_headers)
+ 
+     except NotImplementedError as e:
++        logger.warning("Unsupported feature: %s", e)
+         return JSONResponse(status_code=400, content={
+             "type": "error", "error": {"type": "invalid_request_error", "message": str(e),
+                                         "suggestion": "Use native Anthropic API for this feature."}})
+@@ -92,17 +134,26 @@ async def messages(request: Request):
+ 
+ 
+ async def _stream(
+-    openai_body: dict, headers: dict[str, str], bridge_warnings: list[str] | None = None,
++    openai_body: dict, headers: dict[str, str],
++    bridge_warnings: list[str] | None = None, start_time: float = 0,
+ ) -> StreamingResponse:
++    event_count = 0
++
+     async def gen():
++        nonlocal event_count
+         async with client.stream("POST", "/chat/completions", json=openai_body, headers=headers) as resp:
++            logger.info("Streaming started status=%d", resp.status_code)
++
+             async def lines():
+                 async for line in resp.aiter_lines():
+                     if line:
+                         yield line
+             adapter = OpenAIToAnthropicStreamAdapter(lines())
+             async for event in adapter:
++                event_count += 1
+                 yield f"event: {event.get('type', 'unknown')}\ndata: {json.dumps(event)}\n\n"
++            elapsed = time.time() - start_time if start_time else 0
++            logger.info("Streaming complete events=%d elapsed=%.2fs", event_count, elapsed)
+ 
+     response_headers = {}
+     if bridge_warnings:
+diff --git a/translation/forward.py b/translation/forward.py
+index 3d36f08..6e52a7b 100644
+--- a/translation/forward.py
++++ b/translation/forward.py
+@@ -9,8 +9,7 @@
+ import json
+ from typing import Any
+ 
+-import logging
+-
++from bridge.logging_config import get_logger
+ from translation.config import TranslationConfig, UNSUPPORTED_FEATURES, STRIPPED_FEATURES
+ from translation.tools import translate_tools as _translate_tools
+ from enrichment.system_preamble import strip_anthropic_identity
+@@ -19,7 +18,7 @@
+ translate_tools = _translate_tools
+ 
+ _config = TranslationConfig()
+-logger = logging.getLogger(__name__)
++logger = get_logger("forward")
+ 
+ # Content block types that belong to Anthropic's thinking feature.
+ # These are stripped from messages when forwarding to xAI.
+diff --git a/translation/reverse.py b/translation/reverse.py
+index a07ccd2..8beec70 100644
+--- a/translation/reverse.py
++++ b/translation/reverse.py
+@@ -10,9 +10,11 @@
+ import uuid
+ from typing import Any
+ 
++from bridge.logging_config import get_logger
+ from translation.config import TranslationConfig, STOP_REASON_MAP
+ 
+ _config = TranslationConfig()
++logger = get_logger("reverse")
+ 
+ _ERROR_TYPE_MAP: dict[str, str] = {
+     "rate_limit_error": "rate_limit_error",
+@@ -56,7 +58,13 @@ def openai_to_anthropic(response: dict[str, Any]) -> dict[str, Any]:
+ def translate_response(response: dict[str, Any], status_code: int = 200) -> dict[str, Any]:
+     """Translate an OpenAI response or error to Anthropic format."""
+     if 200 <= status_code < 300:
+-        return openai_to_anthropic(response)
++        result = openai_to_anthropic(response)
++        logger.debug(
++            "Reverse translation: %d content blocks, stop=%s",
++            len(result.get("content", [])), result.get("stop_reason"),
++        )
++        return result
++    logger.debug("Translating error response status=%d", status_code)
+     return _translate_error(response, status_code)
+ 
+ 
+diff --git a/translation/tools.py b/translation/tools.py
+index 17eada4..e767cf4 100644
+--- a/translation/tools.py
++++ b/translation/tools.py
+@@ -10,6 +10,10 @@
+ 
+ from typing import Any, Callable
+ 
++from bridge.logging_config import get_logger
++
++logger = get_logger("forward")
++
+ 
+ # --- Enrichment Hook Type ---
+ # A callable that receives the tool list and returns a modified tool list.
+@@ -27,6 +31,7 @@ def set_tool_enrichment_hook(hook: ToolEnrichmentHook | None) -> None:
+     """
+     global _tool_enrichment_hook
+     _tool_enrichment_hook = hook
++    logger.debug("Tool enrichment hook %s", "registered" if hook else "cleared")
+ 
+ 
+ def translate_tools(
+@@ -46,6 +51,10 @@ def translate_tools(
+     # --- Enrichment injection point ---
+     tools = anthropic_tools
+     if _tool_enrichment_hook is not None:
++        logger.debug(
++            "Running enrichment hook on %d tools",
++            len(anthropic_tools),
++        )
+         tools = _tool_enrichment_hook(tools)
+ 
+     result: list[dict[str, Any]] = []
+diff --git a/enrichment/system_preamble.py b/enrichment/system_preamble.py
+index 206de61..50f2c09 100644
+--- a/enrichment/system_preamble.py
++++ b/enrichment/system_preamble.py
+@@ -34,22 +34,26 @@
+ # These are stripped from the system text before forwarding to Grok.
+ _ANTHROPIC_IDENTITY_PATTERNS: list[re.Pattern[str]] = [
+     # "You are powered by the model named Claude Opus 4.6..."
++    # Uses [^\n]*? (lazy, allows dots) + sentence-end anchor to handle
++    # version numbers like "4.6" without stopping at the internal period.
+     re.compile(
+-        r"You are powered by the model named[^\n.]*\.\s*"
+-        r"(?:The exact model ID is[^\n.]*\.\s*)?",
+-        re.IGNORECASE,
++        r"You are powered by the model named[^\n]*?(?:\.\s+|\.\s*$)"
++        r"(?:The exact model ID is[^\n]*?(?:\.\s+|\.\s*$))?",
++        re.IGNORECASE | re.MULTILINE,
+     ),
+     # "You are powered by Claude Opus 4.6" (shorter variant)
+     re.compile(
+-        r"You are powered by Claude[^\n.]*\.\s*",
+-        re.IGNORECASE,
++        r"You are powered by Claude[^\n]*?(?:\.\s+|\.\s*$)",
++        re.IGNORECASE | re.MULTILINE,
+     ),
+     # Standalone model ID references like "The exact model ID is claude-opus-4-6."
++    # Model IDs use hyphens not dots, so [^\n.] is safe here.
+     re.compile(
+         r"The exact model ID is claude[^\n.]*\.\s*",
+         re.IGNORECASE,
+     ),
+     # "Assistant knowledge cutoff is ..." (Anthropic-specific framing)
++    # Month names don't contain dots, so [^\n.] is safe here.
+     re.compile(
+         r"Assistant knowledge cutoff is[^\n.]*\.\s*",
+         re.IGNORECASE,
+@@ -155,27 +159,58 @@ def get_system_preamble() -> str:
+     return "\n".join(parts)
+ 
+ 
+-def strip_anthropic_identity(system_text: str) -> str:
+-    """Remove Anthropic/Claude identity assertions from a system prompt.
++def _strip_text(text: str) -> str:
++    """Apply identity-stripping regexes to a single string.
+ 
+-    Strips patterns like "You are powered by Claude Opus 4.6",
+-    model ID references, and <claude_background_info> blocks.
+-    Returns the cleaned text. If IDENTITY_ENABLED is false, returns
+-    the text unchanged (no stripping needed when identity is not overridden).
++    Returns the cleaned text with collapsed blank lines and stripped whitespace.
+     """
+-    identity_enabled = os.getenv("IDENTITY_ENABLED", "true").lower()
+-    if identity_enabled == "false":
+-        return system_text
+-
+-    result = system_text
++    result = text
+     for pattern in _ANTHROPIC_IDENTITY_PATTERNS:
+         result = pattern.sub("", result)
+-
+-    # Clean up leftover blank lines from stripped blocks
+     result = re.sub(r"\n{3,}", "\n\n", result)
+     return result.strip()
+ 
+ 
++def strip_anthropic_identity(
++    system: str | list[dict[str, Any]],
++) -> str | list[dict[str, Any]]:
++    """Remove Anthropic/Claude identity assertions from a system prompt.
++
++    Handles both system prompt formats sent by the Anthropic Messages API:
++    - String: applies regex patterns directly
++    - List of content blocks: iterates blocks, strips text in each
++      ``{"type": "text"}`` block, removes blocks that become empty
++
++    Strips patterns like "You are powered by Claude Opus 4.6",
++    model ID references, and ``<claude_background_info>`` blocks.
++    If IDENTITY_ENABLED is false, returns the input unchanged.
++    """
++    identity_enabled = os.getenv("IDENTITY_ENABLED", "true").lower()
++    if identity_enabled == "false":
++        return system
++
++    if isinstance(system, str):
++        return _strip_text(system)
++
++    if isinstance(system, list):
++        result_blocks: list[dict[str, Any]] = []
++        for block in system:
++            if not isinstance(block, dict):
++                result_blocks.append(block)
++                continue
++            if block.get("type") != "text":
++                result_blocks.append(block)
++                continue
++            cleaned = _strip_text(block.get("text", ""))
++            if cleaned:
++                result_blocks.append({**block, "text": cleaned})
++        return result_blocks
++
++    raise TypeError(
++        f"Expected str or list for system field, got {type(system).__name__}"
++    )
++
++
+ def inject_system_preamble(
+     messages: list[dict[str, Any]],
+     preamble: str,
+diff --git a/translation/forward.py b/translation/forward.py
+index 6e52a7b..6e94fbe 100644
+--- a/translation/forward.py
++++ b/translation/forward.py
+@@ -65,6 +65,29 @@ def strip_thinking(request: dict[str, Any]) -> list[str]:
+     return warnings
+ 
+ 
++def _flatten_system(system: str | list[dict[str, Any]]) -> str:
++    """Flatten a system prompt to a single string.
++
++    Handles both Anthropic system prompt formats:
++    - String: returned as-is
++    - List of content blocks: text blocks are joined with newlines,
++      non-text blocks are skipped
++    """
++    if isinstance(system, str):
++        return system
++    if isinstance(system, list):
++        parts: list[str] = []
++        for block in system:
++            if isinstance(block, dict) and block.get("type") == "text":
++                text = block.get("text", "")
++                if text:
++                    parts.append(text)
++        return "\n\n".join(parts)
++    raise TypeError(
++        f"Expected str or list for system field, got {type(system).__name__}"
++    )
++
++
+ def anthropic_to_openai(request: dict[str, Any]) -> dict[str, Any]:
+     """Translate a full Anthropic Messages API request to OpenAI format."""
+     for feature in UNSUPPORTED_FEATURES:
+@@ -77,8 +100,12 @@ def anthropic_to_openai(request: dict[str, Any]) -> dict[str, Any]:
+     messages: list[dict[str, Any]] = []
+ 
+     # System prompt: top-level field -> system role message
+-    # Strip Anthropic identity claims before prepending our preamble
+-    system = strip_anthropic_identity(request.get("system", ""))
++    # The Anthropic API sends system as either a string or a list of
++    # content blocks (e.g. [{"type": "text", "text": "..."}]).
++    # Strip Anthropic identity claims, then flatten to a string for OpenAI.
++    raw_system = request.get("system", "")
++    stripped = strip_anthropic_identity(raw_system)
++    system = _flatten_system(stripped)
+     preamble = _config.system_prompt_preamble
+     if preamble and system:
+         system = f"{preamble}\n\n{system}"

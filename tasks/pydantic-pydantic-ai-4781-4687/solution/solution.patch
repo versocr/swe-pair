@@ -1,0 +1,385 @@
+diff --git a/docs/capabilities.md b/docs/capabilities.md
+index d80d7623e0b..e640a7f3089 100644
+--- a/docs/capabilities.md
++++ b/docs/capabilities.md
+@@ -125,6 +125,7 @@ The full set of configuration methods:
+ | [`get_model_settings()`][pydantic_ai.capabilities.AbstractCapability.get_model_settings] | [`AgentModelSettings`][pydantic_ai.agent.abstract.AgentModelSettings] ` \| None` | Model settings dict, or a callable for [per-step settings](#dynamic-model-settings) |
+ | [`get_toolset()`][pydantic_ai.capabilities.AbstractCapability.get_toolset] | [`AgentToolset`][pydantic_ai.toolsets.AgentToolset] ` \| None` | A [toolset](toolsets.md) to register with the agent |
+ | [`get_builtin_tools()`][pydantic_ai.capabilities.AbstractCapability.get_builtin_tools] | `Sequence[AbstractBuiltinTool]` | [Builtin tools](builtin-tools.md) to register |
++| [`get_wrapper_toolset()`][pydantic_ai.capabilities.AbstractCapability.get_wrapper_toolset] | [`AbstractToolset`][pydantic_ai.toolsets.AbstractToolset] ` \| None` | [Wrap the agent's assembled toolset](#toolset-wrapping) |
+ 
+ ### Dynamic model settings
+ 
+@@ -334,6 +335,51 @@ result = agent.run_sync('hello')
+ 
+ The list includes all tool kinds (function, output, unapproved) — use `tool_def.kind` to distinguish. This hook runs after the agent-level [`prepare_tools`][pydantic_ai.tools.ToolsPrepareFunc]. For simple cases, the built-in [`PrepareTools`][pydantic_ai.capabilities.PrepareTools] capability wraps a callable without needing a custom subclass.
+ 
++### Toolset wrapping
++
++While `prepare_tools` modifies tool *definitions* per step, [`get_wrapper_toolset`][pydantic_ai.capabilities.AbstractCapability.get_wrapper_toolset] lets a capability wrap the agent's entire assembled toolset with a [`WrapperToolset`](toolsets.md#changing-tool-execution). This is more powerful — it can intercept tool execution, replace tools entirely, or apply any cross-cutting behavior.
++
++The wrapper receives the combined non-output toolset (after the agent-level [`prepare_tools`][pydantic_ai.tools.ToolsPrepareFunc] wrapping). Output tools are added separately and are not affected.
++
++```python {title="wrapper_toolset_example.py"}
++from dataclasses import dataclass
++from typing import Any
++
++from pydantic_ai import Agent
++from pydantic_ai.capabilities import AbstractCapability
++from pydantic_ai.models.test import TestModel
++from pydantic_ai.toolsets import AbstractToolset
++from pydantic_ai.toolsets.prefixed import PrefixedToolset
++
++
++@dataclass
++class NamespaceTools(AbstractCapability[Any]):
++    """Prefixes all tool names with a namespace."""
++
++    namespace: str
++
++    def get_wrapper_toolset(
++        self, toolset: AbstractToolset[Any]
++    ) -> AbstractToolset[Any]:
++        return PrefixedToolset(toolset, prefix=self.namespace)
++
++
++agent = Agent(TestModel(), capabilities=[NamespaceTools(namespace='myapp')])
++
++
++@agent.tool_plain
++def greet(name: str) -> str:
++    """Greet someone."""
++    return f'Hello, {name}!'
++
++
++result = agent.run_sync('hello')
++# The model sees `myapp_greet` instead of `greet`
++```
++
++!!! note
++    `prepare_tools` can also be expressed as a wrapper: `get_wrapper_toolset(toolset) -> toolset.prepared(fn)`. The difference is that `prepare_tools` (the capability hook) operates on tool *definitions* for all tool kinds per step, while `get_wrapper_toolset` wraps the non-output *toolset* once per run (during toolset assembly), intercepting tool execution rather than just modifying definitions.
++
+ ### Event stream hook
+ 
+ For runs with event streaming ([`run_stream_events`][pydantic_ai.agent.AbstractAgent.run_stream_events], [`event_stream_handler`][pydantic_ai.agent.Agent.__init__], [UI event streams](ui/overview.md)), capabilities can observe or transform the event stream:
+diff --git a/pydantic_ai_slim/pydantic_ai/agent/__init__.py b/pydantic_ai_slim/pydantic_ai/agent/__init__.py
+index da580bb94ec..c05df413202 100644
+--- a/pydantic_ai_slim/pydantic_ai/agent/__init__.py
++++ b/pydantic_ai_slim/pydantic_ai/agent/__init__.py
+@@ -1107,6 +1107,7 @@ def get_model_settings(run_context: RunContext[AgentDepsT]) -> ModelSettings | N
+             output_toolset=output_toolset,
+             additional_toolsets=toolsets,
+             cap_toolsets=cap_toolsets,
++            run_capability=run_capability,
+         )
+         toolset = await toolset.for_run(initial_ctx)
+         tool_manager = ToolManager[AgentDepsT](
+@@ -2095,6 +2096,7 @@ def _get_toolset(
+         output_toolset: AbstractToolset[AgentDepsT] | None | _utils.Unset = _utils.UNSET,
+         additional_toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+         cap_toolsets: Sequence[AgentToolset[AgentDepsT]] | None = None,
++        run_capability: AbstractCapability[AgentDepsT] | None = None,
+     ) -> AbstractToolset[AgentDepsT]:
+         """Get the complete toolset.
+ 
+@@ -2102,17 +2104,24 @@ def _get_toolset(
+             output_toolset: The output toolset to use instead of the one built at agent construction time.
+             additional_toolsets: Additional toolsets to add, unless toolsets have been overridden.
+             cap_toolsets: Per-run capability toolsets to use instead of the init-time capability toolsets.
++            run_capability: The per-run capability instance, used to apply wrapper toolsets.
+         """
+         toolsets = list(self._build_toolset_list(cap_toolsets=cap_toolsets))
+         # Don't add additional toolsets if the toolsets have been overridden
+         if additional_toolsets and self._override_toolsets.get() is None:
+             toolsets = [*toolsets, *additional_toolsets]
+ 
+-        toolset = CombinedToolset(toolsets)
++        toolset: AbstractToolset[AgentDepsT] = CombinedToolset(toolsets)
+ 
+         if self._prepare_tools:
+             toolset = PreparedToolset(toolset, self._prepare_tools)
+ 
++        # Let capabilities wrap the assembled non-output toolset
++        if run_capability is not None:
++            wrapper = run_capability.get_wrapper_toolset(toolset)
++            if wrapper is not None:
++                toolset = wrapper
++
+         output_toolset = output_toolset if _utils.is_set(output_toolset) else self._output_toolset
+         if output_toolset is not None:
+             if self._prepare_output_tools:
+diff --git a/pydantic_ai_slim/pydantic_ai/capabilities/abstract.py b/pydantic_ai_slim/pydantic_ai/capabilities/abstract.py
+index 510a977759f..6adfee0edc5 100644
+--- a/pydantic_ai_slim/pydantic_ai/capabilities/abstract.py
++++ b/pydantic_ai_slim/pydantic_ai/capabilities/abstract.py
+@@ -9,7 +9,7 @@
+ from pydantic_ai.messages import AgentStreamEvent, ModelResponse, ToolCallPart
+ from pydantic_ai.models import ModelRequestContext
+ from pydantic_ai.tools import AgentBuiltinTool, AgentDepsT, RunContext, ToolDefinition
+-from pydantic_ai.toolsets import AgentToolset
++from pydantic_ai.toolsets import AbstractToolset, AgentToolset
+ 
+ if TYPE_CHECKING:
+     from pydantic_ai import _agent_graph
+@@ -97,6 +97,25 @@ def get_builtin_tools(self) -> Sequence[AgentBuiltinTool[AgentDepsT]]:
+         """Return builtin tools to register with the agent."""
+         return []
+ 
++    def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT] | None:
++        """Wrap the agent's assembled toolset, or return None to leave it unchanged.
++
++        Called per-run with the combined non-output toolset (after agent-level
++        [`prepare_tools`][pydantic_ai.tools.ToolsPrepareFunc] wrapping).
++        Output tools are added separately and are not included.
++
++        Unlike the other `get_*` methods which are called once at agent construction,
++        this is called each run (after [`for_run`][pydantic_ai.capabilities.AbstractCapability.for_run]).
++        When multiple capabilities provide wrappers, each receives the already-wrapped
++        toolset from earlier capabilities (first capability wraps innermost).
++
++        Use this to apply cross-cutting toolset wrappers like
++        [`PreparedToolset`][pydantic_ai.toolsets.PreparedToolset],
++        [`FilteredToolset`][pydantic_ai.toolsets.FilteredToolset],
++        or custom [`WrapperToolset`][pydantic_ai.toolsets.WrapperToolset] subclasses.
++        """
++        return None
++
+     # --- Tool preparation hook ---
+ 
+     async def prepare_tools(
+diff --git a/pydantic_ai_slim/pydantic_ai/capabilities/combined.py b/pydantic_ai_slim/pydantic_ai/capabilities/combined.py
+index 4b46e9104b2..b526e6f4661 100644
+--- a/pydantic_ai_slim/pydantic_ai/capabilities/combined.py
++++ b/pydantic_ai_slim/pydantic_ai/capabilities/combined.py
+@@ -85,6 +85,16 @@ def get_builtin_tools(self) -> Sequence[AgentBuiltinTool[AgentDepsT]]:
+             builtin_tools.extend(capability.get_builtin_tools() or [])
+         return builtin_tools
+ 
++    def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT] | None:
++        wrapped = toolset
++        any_wrapped = False
++        for capability in self.capabilities:
++            result = capability.get_wrapper_toolset(wrapped)
++            if result is not None:
++                wrapped = result
++                any_wrapped = True
++        return wrapped if any_wrapped else None
++
+     # --- Tool preparation hook ---
+ 
+     async def prepare_tools(
+diff --git a/pydantic_ai_slim/pydantic_ai/_agent_graph.py b/pydantic_ai_slim/pydantic_ai/_agent_graph.py
+index a04bdc5e879..2b46f747eab 100644
+--- a/pydantic_ai_slim/pydantic_ai/_agent_graph.py
++++ b/pydantic_ai_slim/pydantic_ai/_agent_graph.py
+@@ -82,6 +82,22 @@ class GraphAgentState:
+     last_max_tokens: int | None = None
+     """Last-resolved `max_tokens` from model settings, used only in error messages."""
+ 
++    def check_incomplete_tool_call(self) -> None:
++        """Raise `IncompleteToolCall` if the last model response was truncated mid-tool-call."""
++        if (
++            self.message_history
++            and isinstance(model_response := self.message_history[-1], _messages.ModelResponse)
++            and model_response.finish_reason == 'length'
++            and model_response.parts
++            and isinstance(tool_call := model_response.parts[-1], _messages.ToolCallPart)
++        ):
++            try:
++                tool_call.args_as_dict(raise_if_invalid=True)
++            except Exception:
++                raise exceptions.IncompleteToolCall(
++                    f'Model token limit ({self.last_max_tokens or "provider default"}) exceeded while generating a tool call, resulting in incomplete arguments. Increase the `max_tokens` model setting, or simplify the prompt to result in a shorter response that will fit within the limit.'
++                )
++
+     def increment_retries(
+         self,
+         max_result_retries: int,
+@@ -89,26 +105,9 @@ def increment_retries(
+     ) -> None:
+         self.retries += 1
+         if self.retries > max_result_retries:
+-            if (
+-                self.message_history
+-                and isinstance(model_response := self.message_history[-1], _messages.ModelResponse)
+-                and model_response.finish_reason == 'length'
+-                and model_response.parts
+-                and isinstance(tool_call := model_response.parts[-1], _messages.ToolCallPart)
+-            ):
+-                try:
+-                    tool_call.args_as_dict(raise_if_invalid=True)
+-                except Exception:
+-                    raise exceptions.IncompleteToolCall(
+-                        f'Model token limit ({self.last_max_tokens or "provider default"}) exceeded while generating a tool call, resulting in incomplete arguments. Increase the `max_tokens` model setting, or simplify the prompt to result in a shorter response that will fit within the limit.'
+-                    )
++            self.check_incomplete_tool_call()
+             message = f'Exceeded maximum retries ({max_result_retries}) for output validation'
+-            if error:
+-                if isinstance(error, exceptions.UnexpectedModelBehavior) and error.__cause__ is not None:
+-                    error = error.__cause__
+-                raise exceptions.UnexpectedModelBehavior(message) from error
+-            else:
+-                raise exceptions.UnexpectedModelBehavior(message)
++            raise exceptions.UnexpectedModelBehavior(message) from error
+ 
+ 
+ @dataclasses.dataclass(kw_only=True)
+@@ -1301,8 +1300,12 @@ async def process_tool_calls(  # noqa: C901
+                     ):
+                         yield event
+                     continue
+-                ctx.state.increment_retries(ctx.deps.max_result_retries, error=e)
+-                raise  # pragma: lax no cover
++                ctx.state.check_incomplete_tool_call()  # pragma: lax no cover
++                tool = tool_manager.tools.get(call.tool_name) if tool_manager.tools else None  # pragma: lax no cover
++                max_retries = tool.max_retries if tool else ctx.deps.max_result_retries  # pragma: lax no cover
++                raise exceptions.UnexpectedModelBehavior(  # pragma: lax no cover
++                    f'Exceeded maximum retries ({max_retries}) for output validation'
++                ) from (e.__cause__ or e)
+ 
+             if not validated.args_valid:
+                 assert validated.validation_error is not None
+@@ -1313,7 +1316,6 @@ async def process_tool_calls(  # noqa: C901
+                         yield event
+                     continue
+ 
+-                ctx.state.increment_retries(ctx.deps.max_result_retries, error=validated.validation_error)
+                 yield _messages.FunctionToolCallEvent(call, args_valid=False)
+                 output_parts.append(validated.validation_error.tool_retry)
+                 yield _messages.FunctionToolResultEvent(validated.validation_error.tool_retry)
+@@ -1329,13 +1331,14 @@ async def process_tool_calls(  # noqa: C901
+                     ):
+                         yield event
+                     continue
+-                ctx.state.increment_retries(ctx.deps.max_result_retries, error=e)
+-                raise  # pragma: lax no cover
++                ctx.state.check_incomplete_tool_call()  # pragma: lax no cover
++                max_retries = (
++                    validated.tool.max_retries if validated.tool else ctx.deps.max_result_retries
++                )  # pragma: lax no cover
++                raise exceptions.UnexpectedModelBehavior(  # pragma: lax no cover
++                    f'Exceeded maximum retries ({max_retries}) for output validation'
++                ) from (e.__cause__ or e)
+             except ToolRetryError as e:
+-                # If we already have a valid final result, don't increment retries for invalid output tools
+-                # This allows the run to succeed if at least one output tool returned a valid result
+-                if not final_result:
+-                    ctx.state.increment_retries(ctx.deps.max_result_retries, error=e)
+                 yield _messages.FunctionToolCallEvent(call, args_valid=True)
+                 output_parts.append(e.tool_retry)
+                 yield _messages.FunctionToolResultEvent(e.tool_retry)
+diff --git a/pydantic_ai_slim/pydantic_ai/_output.py b/pydantic_ai_slim/pydantic_ai/_output.py
+index 4183ef66644..a35cbabfc54 100644
+--- a/pydantic_ai_slim/pydantic_ai/_output.py
++++ b/pydantic_ai_slim/pydantic_ai/_output.py
+@@ -864,7 +864,10 @@ class OutputToolset(AbstractToolset[AgentDepsT]):
+     """The tool definitions for the output tools in this toolset."""
+     processors: dict[str, ObjectOutputProcessor[Any]]
+     """The processors for the output tools in this toolset."""
+-    max_retries: int
++    max_retries: int | None
++    """Default max retries for output tools, set by the Agent. Per-tool overrides from `ToolOutput.max_retries` take priority."""
++    _max_retries_overrides: dict[str, int]
++    """Per-tool max_retries overrides from `ToolOutput(max_retries=N)`."""
+     output_validators: list[OutputValidator[AgentDepsT, Any]]
+ 
+     @classmethod
+@@ -885,6 +888,9 @@ def build(
+         default_description = description
+         default_strict = strict
+ 
++        max_retries_overrides: dict[str, int] = {}
++        tool_output_max_retries: int | None = None
++
+         multiple = len(outputs) > 1
+         for output in outputs:
+             name = None
+@@ -895,6 +901,7 @@ def build(
+                 name = output.name
+                 description = output.description
+                 strict = output.strict
++                tool_output_max_retries = output.max_retries
+ 
+                 output = output.output  # pyright: ignore[reportUnknownVariableType,reportUnknownMemberType]
+ 
+@@ -934,19 +941,24 @@ def build(
+             )
+             processors[name] = processor
+             tool_defs.append(tool_def)
++            if tool_output_max_retries is not None:
++                max_retries_overrides[name] = tool_output_max_retries
++            tool_output_max_retries = None
+ 
+-        return cls(processors=processors, tool_defs=tool_defs)
++        return cls(processors=processors, tool_defs=tool_defs, max_retries_overrides=max_retries_overrides)
+ 
+     def __init__(
+         self,
+         tool_defs: list[ToolDefinition],
+         processors: dict[str, ObjectOutputProcessor[Any]],
+-        max_retries: int = 1,
++        max_retries: int | None = None,
++        max_retries_overrides: dict[str, int] | None = None,
+         output_validators: list[OutputValidator[AgentDepsT, Any]] | None = None,
+     ):
+         self.processors = processors
+         self._tool_defs = tool_defs
+         self.max_retries = max_retries
++        self._max_retries_overrides = max_retries_overrides or {}
+         self.output_validators = output_validators or []
+ 
+     @property
+@@ -958,11 +970,12 @@ def label(self) -> str:
+         return "the agent's output tools"
+ 
+     async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
++        max_retries = self.max_retries if self.max_retries is not None else 1
+         return {
+             tool_def.name: ToolsetTool(
+                 toolset=self,
+                 tool_def=tool_def,
+-                max_retries=self.max_retries,
++                max_retries=self._max_retries_overrides.get(tool_def.name, max_retries),
+                 args_validator=self.processors[tool_def.name].validator,
+             )
+             for tool_def in self._tool_defs
+diff --git a/pydantic_ai_slim/pydantic_ai/agent/__init__.py b/pydantic_ai_slim/pydantic_ai/agent/__init__.py
+index 84241d68c07..7579cec416d 100644
+--- a/pydantic_ai_slim/pydantic_ai/agent/__init__.py
++++ b/pydantic_ai_slim/pydantic_ai/agent/__init__.py
+@@ -443,7 +443,7 @@ def __init__(
+         self._prepare_output_tools = prepare_output_tools
+ 
+         self._output_toolset = self._output_schema.toolset
+-        if self._output_toolset:
++        if self._output_toolset and self._output_toolset.max_retries is None:
+             self._output_toolset.max_retries = self._max_result_retries
+ 
+         self._function_toolset = _AgentFunctionToolset(
+@@ -1103,7 +1103,8 @@ def _merged_meta(ctx: RunContext[AgentDepsT]) -> dict[str, Any]:
+         if output_schema != self._output_schema or output_validators:
+             output_toolset = output_schema.toolset
+             if output_toolset:
+-                output_toolset.max_retries = self._max_result_retries
++                if output_toolset.max_retries is None:
++                    output_toolset.max_retries = self._max_result_retries
+                 output_toolset.output_validators = output_validators
+ 
+         # Build the graph
+diff --git a/pydantic_ai_slim/pydantic_ai/output.py b/pydantic_ai_slim/pydantic_ai/output.py
+index a1ccf81a015..5ca5be9e3a5 100644
+--- a/pydantic_ai_slim/pydantic_ai/output.py
++++ b/pydantic_ai_slim/pydantic_ai/output.py
+@@ -113,7 +113,11 @@ class Vehicle(BaseModel):
+     description: str | None
+     """The description of the tool that will be passed to the model. If not specified, the docstring of the output type or function will be used."""
+     max_retries: int | None
+-    """The maximum number of retries for the tool."""
++    """The maximum number of retries for this specific output tool.
++
++    Overrides the agent-level `retries`/`output_retries` for this tool.
++    If not set, the agent-level value is used as the default.
++    """
+     strict: bool | None
+     """Whether to use strict mode for the tool."""
+ 

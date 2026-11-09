@@ -1,0 +1,243 @@
+diff --git a/docs/src/content/docs/enterprise/security.md b/docs/src/content/docs/enterprise/security.md
+index 7340694266..e6793bf7b6 100644
+--- a/docs/src/content/docs/enterprise/security.md
++++ b/docs/src/content/docs/enterprise/security.md
+@@ -175,12 +175,15 @@ A path must pass all three checks. Failure on any check prevents the file from b
+ 
+ ### Symlink handling
+ 
+-Symlinks are never followed during artifact operations:
++Symlinks are never followed during file discovery or artifact operations:
+ 
+-- **Tree copy operations** skip symlinks entirely — they are excluded from the copy via an ignore filter.
++- **Primitive discovery** (instructions, agents, prompts, contexts, skills) rejects symlinked files during glob-based file enumeration. Symlinks are silently skipped.
++- **Prompt resolution** (`apm preview`, `apm run`) rejects symlinked `.prompt.md` files with an explicit error message.
++- **Integrator file discovery** (agents, instructions, prompts, skills, hooks) rejects symlinked files via `is_symlink()` checks in `find_files_by_glob` and `find_hook_files`.
++- **Tree copy operations** skip symlinks entirely -- they are excluded from the copy via an ignore filter.
+ - **MCP configuration files** that are symlinks are rejected with a warning and not parsed.
+ - **Manifest parsing** requires files to pass both `.is_file()` and `not .is_symlink()` checks.
+-- **Archive creation** — `apm pack` excludes symlinks from bundled archives. Packaged artifacts contain no symbolic links, preventing symlink-based escape attacks in distributed bundles.
++- **Archive creation** -- `apm pack` excludes symlinks from bundled archives. Packaged artifacts contain no symbolic links, preventing symlink-based escape attacks in distributed bundles.
+ 
+ This prevents symlink-based attacks that could escape allowed directories or cause APM to read or write outside the project root.
+ 
+diff --git a/src/apm_cli/core/script_runner.py b/src/apm_cli/core/script_runner.py
+index 6c79ae2b02..f873ca66ca 100644
+--- a/src/apm_cli/core/script_runner.py
++++ b/src/apm_cli/core/script_runner.py
+@@ -546,22 +546,24 @@ def _discover_prompt_file(self, name: str) -> Optional[Path]:
+         ]
+ 
+         for path in local_search_paths:
+-            if path.exists():
++            if path.exists() and not path.is_symlink():
+                 return path
+ 
+         # 2. Search in dependencies and detect collisions
+         apm_modules = Path("apm_modules")
+         if apm_modules.exists():
+             # Collect ALL .prompt.md matches to detect collisions
+-            matches = list(apm_modules.rglob(search_name))
++            raw_matches = list(apm_modules.rglob(search_name))
+ 
+             # Also search for SKILL.md in directories matching the name
+-            # e.g., name="architecture-blueprint-generator" -> find */architecture-blueprint-generator/SKILL.md
+             for skill_dir in apm_modules.rglob(name):
+                 if skill_dir.is_dir():
+                     skill_file = skill_dir / "SKILL.md"
+                     if skill_file.exists():
+-                        matches.append(skill_file)
++                        raw_matches.append(skill_file)
++
++            # Filter out symlinks
++            matches = [m for m in raw_matches if not m.is_symlink()]
+ 
+             if len(matches) == 0:
+                 return None
+@@ -945,6 +947,8 @@ def compile(self, prompt_file: str, params: Dict[str, str]) -> str:
+     def _resolve_prompt_file(self, prompt_file: str) -> Path:
+         """Resolve prompt file path, checking local directory first, then common directories, then dependencies.
+ 
++        Symlinks are rejected outright to prevent traversal attacks.
++
+         Args:
+             prompt_file: Relative path to the .prompt.md file
+ 
+@@ -952,40 +956,40 @@ def _resolve_prompt_file(self, prompt_file: str) -> Path:
+             Path: Resolved path to the prompt file
+ 
+         Raises:
+-            FileNotFoundError: If prompt file is not found in local or dependency modules
++            FileNotFoundError: If prompt file is not found or is a symlink
+         """
+         prompt_path = Path(prompt_file)
+ 
+         # First check if it exists in current directory (local)
+         if prompt_path.exists():
++            if prompt_path.is_symlink():
++                raise FileNotFoundError(
++                    f"Prompt file '{prompt_file}' is a symlink. "
++                    f"Symlinks are not allowed for security reasons."
++                )
+             return prompt_path
+ 
+         # Check in common project directories
+         common_dirs = [".github/prompts", ".apm/prompts"]
+         for common_dir in common_dirs:
+             common_path = Path(common_dir) / prompt_file
+-            if common_path.exists():
++            if common_path.exists() and not common_path.is_symlink():
+                 return common_path
+ 
+         # If not found locally, search in dependency modules
+         apm_modules_dir = Path("apm_modules")
+         if apm_modules_dir.exists():
+-            # Search all dependency directories for the prompt file
+-            # Handle org/repo directory structure (e.g., apm_modules/microsoft/apm-sample-package/)
+             for org_dir in apm_modules_dir.iterdir():
+                 if org_dir.is_dir() and not org_dir.name.startswith("."):
+-                    # Iterate through repos within the org
+                     for repo_dir in org_dir.iterdir():
+                         if repo_dir.is_dir() and not repo_dir.name.startswith("."):
+-                            # Check in the root of the repository
+                             dep_prompt_path = repo_dir / prompt_file
+-                            if dep_prompt_path.exists():
++                            if dep_prompt_path.exists() and not dep_prompt_path.is_symlink():
+                                 return dep_prompt_path
+ 
+-                            # Also check in common subdirectories
+                             for subdir in ["prompts", ".", "workflows"]:
+                                 sub_prompt_path = repo_dir / subdir / prompt_file
+-                                if sub_prompt_path.exists():
++                                if sub_prompt_path.exists() and not sub_prompt_path.is_symlink():
+                                     return sub_prompt_path
+ 
+         # If still not found, raise an error with helpful message
+diff --git a/src/apm_cli/integration/base_integrator.py b/src/apm_cli/integration/base_integrator.py
+index 066c6abe35..fa7c92ee5b 100644
+--- a/src/apm_cli/integration/base_integrator.py
++++ b/src/apm_cli/integration/base_integrator.py
+@@ -409,6 +409,8 @@ def find_files_by_glob(
+     ) -> List[Path]:
+         """Search *package_path* (and optional subdirectories) for *pattern*.
+ 
++        Symlinks are rejected outright to prevent traversal attacks.
++
+         Args:
+             package_path: Root of the installed package.
+             pattern: Glob pattern (e.g. ``"*.prompt.md"``).
+@@ -429,6 +431,8 @@ def find_files_by_glob(
+             if not d.exists():
+                 continue
+             for f in sorted(d.glob(pattern)):
++                if f.is_symlink():
++                    continue
+                 resolved = f.resolve()
+                 if resolved not in seen:
+                     seen.add(resolved)
+diff --git a/src/apm_cli/integration/hook_integrator.py b/src/apm_cli/integration/hook_integrator.py
+index 658e63886b..e21acdb629 100644
+--- a/src/apm_cli/integration/hook_integrator.py
++++ b/src/apm_cli/integration/hook_integrator.py
+@@ -151,6 +151,8 @@ def find_hook_files(self, package_path: Path) -> List[Path]:
+         apm_hooks = package_path / ".apm" / "hooks"
+         if apm_hooks.exists():
+             for f in sorted(apm_hooks.glob("*.json")):
++                if f.is_symlink():
++                    continue
+                 resolved = f.resolve()
+                 if resolved not in seen:
+                     seen.add(resolved)
+@@ -160,6 +162,8 @@ def find_hook_files(self, package_path: Path) -> List[Path]:
+         hooks_dir = package_path / "hooks"
+         if hooks_dir.exists():
+             for f in sorted(hooks_dir.glob("*.json")):
++                if f.is_symlink():
++                    continue
+                 resolved = f.resolve()
+                 if resolved not in seen:
+                     seen.add(resolved)
+diff --git a/src/apm_cli/primitives/discovery.py b/src/apm_cli/primitives/discovery.py
+index 7d10baa851..41c09d24b6 100644
+--- a/src/apm_cli/primitives/discovery.py
++++ b/src/apm_cli/primitives/discovery.py
+@@ -375,6 +375,9 @@ def _discover_skill_in_directory(directory: Path, collection: PrimitiveCollectio
+ def find_primitive_files(base_dir: str, patterns: List[str]) -> List[Path]:
+     """Find primitive files matching the given patterns.
+     
++    Symlinks are rejected outright to prevent symlink-based traversal
++    attacks from malicious packages.
++    
+     Args:
+         base_dir (str): Base directory to search in.
+         patterns (List[str]): List of glob patterns to match.
+@@ -402,10 +405,15 @@ def find_primitive_files(base_dir: str, patterns: List[str]) -> List[Path]:
+             seen.add(abs_path)
+             unique_files.append(Path(abs_path))
+     
+-    # Filter out directories and ensure files are readable
++    # Filter out directories, symlinks, and unreadable files
+     valid_files = []
+     for file_path in unique_files:
+-        if file_path.is_file() and _is_readable(file_path):
++        if not file_path.is_file():
++            continue
++        if file_path.is_symlink():
++            logger.debug("Rejected symlink: %s", file_path)
++            continue
++        if _is_readable(file_path):
+             valid_files.append(file_path)
+     
+     return valid_files
+diff --git a/src/apm_cli/integration/hook_integrator.py b/src/apm_cli/integration/hook_integrator.py
+index e21acdb629..7b200a222a 100644
+--- a/src/apm_cli/integration/hook_integrator.py
++++ b/src/apm_cli/integration/hook_integrator.py
+@@ -203,6 +203,7 @@ def _rewrite_command_for_target(
+         Handles:
+         - ${CLAUDE_PLUGIN_ROOT}/path references (resolved from package root)
+         - ./path relative references (resolved from hook file's parent directory)
++        - Windows backslash variants of both (.\\ and ${CLAUDE_PLUGIN_ROOT}\\)
+ 
+         Args:
+             command: Original command string
+@@ -232,10 +233,14 @@ def _rewrite_command_for_target(
+             scripts_base = f"{base_root}/hooks/{package_name}"
+ 
+         # Handle ${CLAUDE_PLUGIN_ROOT} references (always relative to package root)
+-        plugin_root_pattern = r'\$\{CLAUDE_PLUGIN_ROOT\}(/[^\s]+)'
++        # Match both forward-slash and backslash separators (Windows hook JSON
++        # may use backslashes: ${CLAUDE_PLUGIN_ROOT}\scripts\scan.ps1)
++        plugin_root_pattern = r'\$\{CLAUDE_PLUGIN_ROOT\}([\\/][^\s]+)'
+         for match in re.finditer(plugin_root_pattern, command):
+             full_var = match.group(0)
+-            rel_path = match.group(1).lstrip('/')
++            # Normalize backslashes to forward slashes before Path construction
++            # (on Unix, Path treats backslashes as literal filename chars)
++            rel_path = match.group(1).replace('\\', '/').lstrip('/')
+ 
+             source_file = (package_path / rel_path).resolve()
+             # Reject path traversal outside the package directory
+@@ -246,14 +251,18 @@ def _rewrite_command_for_target(
+                 scripts_to_copy.append((source_file, target_rel))
+                 new_command = new_command.replace(full_var, target_rel)
+ 
+-        # Handle relative ./path references (safe to run after ${CLAUDE_PLUGIN_ROOT}
+-        # substitution since replacements produce paths like ".github/..." not "./...")
++        # Handle relative ./path and .\path references (safe to run after
++        # ${CLAUDE_PLUGIN_ROOT} substitution since replacements produce paths
++        # like ".github/..." not "./" or ".\")
++        # Match both forward-slash and backslash separators (Windows hook JSON
++        # may use backslashes: .\scripts\scan.ps1)
+         # Resolve from hook file's directory if available, else fall back to package root
+         resolve_base = hook_file_dir if hook_file_dir else package_path
+-        rel_pattern = r'(\./[^\s]+)'
++        rel_pattern = r'(\.[\\/][^\s]+)'
+         for match in re.finditer(rel_pattern, new_command):
+             rel_ref = match.group(1)
+-            rel_path = rel_ref[2:]  # Strip ./
++            # Normalize to forward slashes for path resolution
++            rel_path = rel_ref[2:].replace('\\', '/')
+ 
+             source_file = (resolve_base / rel_path).resolve()
+             # Reject path traversal outside the package directory

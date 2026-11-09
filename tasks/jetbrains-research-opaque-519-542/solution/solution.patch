@@ -1,0 +1,601 @@
+diff --git a/docs/reference/accounting.md b/docs/reference/accounting.md
+index a125e181f..5a5a6fc8c 100644
+--- a/docs/reference/accounting.md
++++ b/docs/reference/accounting.md
+@@ -70,6 +70,27 @@ the Rust PLD extension is not loaded until you access these submodules.
+ 
+ ## Classes
+ 
++### Custom budget checkpointing
++
++`Accountant` checkpoints include an optional budget. The built-in budget
++factories are registered automatically. If an application supplies its own
++`Budget` protocol implementation, register a self-contained codec before
++checkpointing:
++
++```python
++import opaque.accounting as acc
++
++acc.register_budget_serializer(
++    MyBudget,
++    lambda budget: {"target": budget.target},
++    lambda state: MyBudget(state["target"]),
++)
++```
++
++The serializer must return JSON-compatible state and the deserializer must
++rebuild the budget from that state. Checkpointing an unregistered budget raises
++`TypeError`; restoring an unknown budget checkpoint type raises `ValueError`.
++
+ ### `DpProcess`
+ 
+ Abstract base class for all privacy processes. Subclasses implement `pld()` to
+diff --git a/packages/opaque-accounting/src/opaque/accounting/__init__.py b/packages/opaque-accounting/src/opaque/accounting/__init__.py
+index 632cdade7..359d3a6fc 100644
+--- a/packages/opaque-accounting/src/opaque/accounting/__init__.py
++++ b/packages/opaque-accounting/src/opaque/accounting/__init__.py
+@@ -45,6 +45,7 @@
+     mechanisms,
+     nonprivate,
+     per_step,
++    register_budget_serializer,
+     repeat,
+     risk_budget,
+     set_discretization,
+@@ -78,5 +79,6 @@
+     "advantage_budget",
+     "beta_budget",
+     "risk_budget",
++    "register_budget_serializer",
+     "calibrate",
+ ]
+diff --git a/packages/opaque-accounting/src/opaque/api/accounting/core/__init__.py b/packages/opaque-accounting/src/opaque/api/accounting/core/__init__.py
+index 51f1b58ef..f7f5a0d44 100644
+--- a/packages/opaque-accounting/src/opaque/api/accounting/core/__init__.py
++++ b/packages/opaque-accounting/src/opaque/api/accounting/core/__init__.py
+@@ -33,6 +33,7 @@
+ # the unified ``opaque.api.base.serialization`` registry.
+ import opaque.api.accounting.core._serialization  # noqa: F401
+ from opaque.api.accounting.core._accountant import Accountant
++from opaque.api.accounting.core._budgets import register_budget_serializer
+ from opaque.api.accounting.core.calibration import (
+     advantage_budget,
+     beta_budget,
+@@ -84,5 +85,6 @@
+     "advantage_budget",
+     "beta_budget",
+     "risk_budget",
++    "register_budget_serializer",
+     "calibrate",
+ ]
+diff --git a/packages/opaque-accounting/src/opaque/api/accounting/core/_accountant.py b/packages/opaque-accounting/src/opaque/api/accounting/core/_accountant.py
+index 7c9241744..6a2b89b1b 100644
+--- a/packages/opaque-accounting/src/opaque/api/accounting/core/_accountant.py
++++ b/packages/opaque-accounting/src/opaque/api/accounting/core/_accountant.py
+@@ -19,16 +19,12 @@
+ 
+ from __future__ import annotations
+ 
+-import dataclasses
+ from typing import TYPE_CHECKING, Any
+ 
+ from opaque.api.accounting.core._budgets import (
+-    AdvantageBudget,
+-    BetaBudget,
+     Budget,
+-    DeltaBudget,
+-    EpsilonBudget,
+-    RiskBudget,
++    budget_from_state_dict,
++    budget_state_dict,
+ )
+ from opaque.api.accounting.core._process_codec import _load_dp_process
+ from opaque.api.accounting.core.mechanisms.types import Identity
+@@ -230,38 +226,17 @@ def _accountant_state_dict(acct: Accountant) -> dict[str, Any]:
+ 
+     out: dict[str, Any] = {"process": dict(opaque_state_dict(acct.process))}
+     if acct._budget is not None:
+-        b = acct._budget
+-        out["budget"] = {"type": type(b).__name__} | {
+-            f.name: getattr(b, f.name) for f in dataclasses.fields(b)
+-        }
++        out["budget"] = budget_state_dict(acct._budget)
+     return out
+ 
+ 
+ def _accountant_from_state_dict(state: dict[str, Any]) -> Accountant:
+     budget = None
+     if "budget" in state:
+-        budget = _deserialize_budget(dict(state["budget"]))
++        budget = budget_from_state_dict(dict(state["budget"]))
+     return Accountant(budget=budget, prefix=_load_dp_process(dict(state["process"])))
+ 
+ 
+-_BUDGET_REGISTRY: dict[str, type] = {
+-    "EpsilonBudget": EpsilonBudget,
+-    "DeltaBudget": DeltaBudget,
+-    "AdvantageBudget": AdvantageBudget,
+-    "BetaBudget": BetaBudget,
+-    "RiskBudget": RiskBudget,
+-}
+-
+-
+-def _deserialize_budget(data: dict[str, Any]) -> Budget:
+-    data = dict(data)
+-    type_name = data.pop("type")
+-    budget_cls = _BUDGET_REGISTRY.get(type_name)
+-    if budget_cls is None:
+-        raise ValueError(f"Unknown budget type: {type_name}")
+-    return budget_cls(**data)
+-
+-
+ def _register_accountant_serialization() -> None:
+     from opaque.serialization import register_serializer
+ 
+diff --git a/packages/opaque-accounting/src/opaque/api/accounting/core/_budgets.py b/packages/opaque-accounting/src/opaque/api/accounting/core/_budgets.py
+index bfaabbec3..e405fff2f 100644
+--- a/packages/opaque-accounting/src/opaque/api/accounting/core/_budgets.py
++++ b/packages/opaque-accounting/src/opaque/api/accounting/core/_budgets.py
+@@ -30,8 +30,10 @@
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
+-from typing import TYPE_CHECKING, Protocol
++from collections.abc import Callable, Mapping
++from dataclasses import dataclass, fields
++from threading import RLock
++from typing import TYPE_CHECKING, Any, Protocol
+ 
+ if TYPE_CHECKING:
+     from opaque.api.accounting.core._base import DpProcess
+@@ -243,6 +245,122 @@ def evaluate(self, process: DpProcess) -> float:
+         return process.risk_at(self.prior)
+ 
+ 
++# =============================================================================
++# Budget serialization
++# =============================================================================
++
++BudgetStateDictFn = Callable[[Any], Mapping[str, Any]]
++BudgetFromStateDictFn = Callable[[Mapping[str, Any]], Budget]
++
++_BUDGET_SERIALIZERS: dict[type[Any], tuple[str, BudgetStateDictFn]] = {}
++_BUDGET_DESERIALIZERS: dict[str, BudgetFromStateDictFn] = {}
++_BUDGET_TYPES: dict[str, type[Any]] = {}
++_BUDGET_LOCK = RLock()
++
++
++def _budget_type_name(typ: type[Any]) -> str:
++    return f"{typ.__module__}.{typ.__qualname__}"
++
++
++def register_budget_serializer(
++    typ: type[Any],
++    state_dict_fn: BudgetStateDictFn,
++    from_state_dict_fn: BudgetFromStateDictFn,
++    *,
++    type_name: str | None = None,
++) -> None:
++    """Register checkpoint serialization for a concrete :class:`Budget` type.
++
++    External implementations of the public ``Budget`` protocol must register a
++    codec before they can be embedded in an :class:`Accountant` checkpoint.
++    ``state_dict_fn`` must return JSON-compatible data and
++    ``from_state_dict_fn`` must reconstruct the budget from that data alone.
++
++    Args:
++        typ: Concrete budget implementation to register.
++        state_dict_fn: Converts a budget instance to checkpoint state.
++        from_state_dict_fn: Reconstructs a budget from checkpoint state.
++        type_name: Stable checkpoint discriminator. Defaults to the fully
++            qualified concrete type name.
++
++    Raises:
++        ValueError: If ``type_name`` is already registered for another type.
++    """
++    with _BUDGET_LOCK:
++        name = type_name or _budget_type_name(typ)
++        registered_type = _BUDGET_TYPES.get(name)
++        if registered_type is not None and registered_type is not typ:
++            raise ValueError(f"Budget checkpoint type name already registered: {name}")
++        previous = _BUDGET_SERIALIZERS.get(typ)
++        if previous is not None and previous[0] != name:
++            _BUDGET_DESERIALIZERS.pop(previous[0], None)
++            _BUDGET_TYPES.pop(previous[0], None)
++        _BUDGET_SERIALIZERS[typ] = (name, state_dict_fn)
++        _BUDGET_DESERIALIZERS[name] = from_state_dict_fn
++        _BUDGET_TYPES[name] = typ
++
++
++def budget_state_dict(budget: Budget) -> dict[str, Any]:
++    """Return self-describing checkpoint state for a registered budget."""
++    with _BUDGET_LOCK:
++        serializer = _BUDGET_SERIALIZERS.get(type(budget))
++    if serializer is None:
++        raise TypeError(
++            f"Cannot serialize budget {_budget_type_name(type(budget))}: "
++            "no budget serializer is registered. Register one with "
++            "`register_budget_serializer`."
++        )
++    type_name, state_dict_fn = serializer
++    state = dict(state_dict_fn(budget))
++    if "type" in state:
++        raise ValueError(
++            f"Budget serializer for {_budget_type_name(type(budget))} returned "
++            "reserved key 'type'."
++        )
++    return {"type": type_name} | state
++
++
++def budget_from_state_dict(state: Mapping[str, Any]) -> Budget:
++    """Reconstruct a registered budget from self-describing checkpoint state."""
++    data = dict(state)
++    try:
++        type_name = data.pop("type")
++    except KeyError as exc:
++        raise ValueError("Budget checkpoint is missing required key 'type'.") from exc
++    if not isinstance(type_name, str):
++        raise ValueError("Budget checkpoint key 'type' must be a string.")
++    with _BUDGET_LOCK:
++        from_state_dict_fn = _BUDGET_DESERIALIZERS.get(type_name)
++    if from_state_dict_fn is None:
++        raise ValueError(
++            f"Cannot restore budget type {type_name!r}: no budget serializer is registered."
++        )
++    return from_state_dict_fn(data)
++
++
++def _dataclass_budget_state_dict(budget: Any) -> dict[str, Any]:
++    return {f.name: getattr(budget, f.name) for f in fields(budget)}
++
++
++def _register_builtin_budget_serializers() -> None:
++    for budget_type in (
++        EpsilonBudget,
++        DeltaBudget,
++        AdvantageBudget,
++        BetaBudget,
++        RiskBudget,
++    ):
++        register_budget_serializer(
++            budget_type,
++            _dataclass_budget_state_dict,
++            lambda state, cls=budget_type: cls(**dict(state)),
++            type_name=budget_type.__name__,
++        )
++
++
++_register_builtin_budget_serializers()
++
++
+ # =============================================================================
+ # Budget factories
+ # =============================================================================
+@@ -366,6 +484,8 @@ def risk_budget(risk: float, prior: float) -> RiskBudget:
+     "AdvantageBudget",
+     "BetaBudget",
+     "RiskBudget",
++    # Serialization
++    "register_budget_serializer",
+     # Budget factories
+     "epsilon_budget",
+     "delta_budget",
+diff --git a/docs/reference/accounting.md b/docs/reference/accounting.md
+index 5a5a6fc8c..c437e13d8 100644
+--- a/docs/reference/accounting.md
++++ b/docs/reference/accounting.md
+@@ -676,11 +676,12 @@ Binary search for a parameter value such that `process(param)` produces a
+ | `prefix`         | `None`  | Already-executed `DpProcess` composed into every probe   |
+ 
+ The `process` callable takes a single float parameter and returns a `DpProcess`.
+-Its metric must be monotone in the direction declared by the budget. The
+-current direction contract supports parameters such as `noise_multiplier`,
+-whose increase improves privacy: epsilon, delta, and advantage decrease, while
+-beta and risk increase. `param_min` must be the unsafe endpoint and `param_max`
+-the privacy-safe endpoint under that contract.
++Its metric must be monotone in the parameter over `[param_min, param_max]`;
++the search direction is derived automatically by probing both endpoints, so
++noise-multiplier-like parameters (increase improves privacy) and
++sample-rate/step-like parameters (increase spends privacy) are both
++supported. Exactly one endpoint must be privacy-safe; which one is detected,
++not positional.
+ 
+ ```python
+ import opaque.accounting as acc
+@@ -762,9 +763,10 @@ optimize and what value to achieve.
+ | `cal.beta_budget(beta, alpha)`      | Type-II error at given Type-I error     | No                    |
+ | `cal.risk_budget(risk, prior)`      | Bayes risk under optimal adversary      | No                    |
+ 
+-"Decreasing with noise" indicates whether the metric decreases as the
+-calibrated parameter (typically noise_multiplier) increases. The binary search
+-adapts direction automatically based on the budget's `decreasing` property.
++"Decreasing with noise" indicates the metric kind: privacy-loss metrics
++(epsilon/delta/advantage) are safe at-or-below the target, privacy-gain
++metrics (beta/risk) at-or-above. The binary search derives the parameter
++direction automatically by probing both bracket endpoints.
+ 
+ ```python
+ # (epsilon, delta)-DP
+diff --git a/docs/user-guide/accounting.md b/docs/user-guide/accounting.md
+index e0a1f41ef..6363cc4ab 100644
+--- a/docs/user-guide/accounting.md
++++ b/docs/user-guide/accounting.md
+@@ -440,21 +440,23 @@ evaluated. If the search cannot find a safe endpoint satisfying
+ 
+ ### Budget types
+ 
+-| Function | Target metric | Direction |
+-|----------|---------------|-----------|
+-| `acc.epsilon_budget(eps, delta)` | epsilon | decreasing (more noise = lower epsilon) |
+-| `acc.delta_budget(delta, epsilon)` | delta | decreasing |
+-| `acc.advantage_budget(adv)` | advantage | decreasing |
+-| `acc.beta_budget(beta, alpha)` | beta | increasing (more noise = higher beta) |
+-| `acc.risk_budget(risk, prior)` | risk | increasing |
++| Function | Target metric | Metric kind |
++|----------|---------------|-------------|
++| `acc.epsilon_budget(eps, delta)` | epsilon | privacy loss (safe at-or-below target) |
++| `acc.delta_budget(delta, epsilon)` | delta | privacy loss (safe at-or-below) |
++| `acc.advantage_budget(adv)` | advantage | privacy loss (safe at-or-below) |
++| `acc.beta_budget(beta, alpha)` | beta | privacy gain (safe at-or-above target) |
++| `acc.risk_budget(risk, prior)` | risk | privacy gain (safe at-or-above) |
+ 
+ ### Search direction
+ 
+-The current search contract supports parameters such as noise multiplier whose
+-increase improves privacy in the direction declared by the selected budget:
+-privacy-loss metrics decrease and privacy-gain metrics increase. The metric
+-produced by `process(param)` must follow that declared direction, with
+-`param_min` as the unsafe endpoint and `param_max` as the safe endpoint.
++The search direction is derived from the calibrated parameter itself: the
++metric is probed at both endpoints and the privacy-safe endpoint detected
++automatically. Parameters whose increase improves privacy (noise multiplier)
++and parameters whose increase spends privacy (sample rate, step count) are
++both supported, for every budget kind. The metric produced by
++`process(param)` must be monotone over `[param_min, param_max]`; flat or
++detectably non-monotone parameterizations raise `ValueError`.
+ 
+ ## Accountant
+ 
+diff --git a/packages/opaque-accounting/src/opaque/api/accounting/core/_budgets.py b/packages/opaque-accounting/src/opaque/api/accounting/core/_budgets.py
+index e405fff2f..33a3d502d 100644
+--- a/packages/opaque-accounting/src/opaque/api/accounting/core/_budgets.py
++++ b/packages/opaque-accounting/src/opaque/api/accounting/core/_budgets.py
+@@ -50,10 +50,13 @@ class Budget(Protocol):
+     - **evaluate(process)**: Compute metric value for a process
+     - **value**: Budget threshold value to achieve
+     - **name**: Human-readable name for debugging
+-    - **decreasing**: Whether the metric decreases as the calibrated parameter
+-      increases.  For noise_multiplier calibration this is ``True`` for
+-      privacy-loss metrics (epsilon, delta, advantage) and ``False`` for
+-      privacy-gain metrics (beta, risk) which *increase* with noise.
++    - **decreasing**: Metric kind — ``True`` for privacy-loss metrics
++      (epsilon, delta, advantage), which are privacy-safe at-or-below the
++      target; ``False`` for privacy-gain metrics (beta, risk), safe
++      at-or-above.  The direction the metric moves as the calibrated
++      *parameter* grows is not declared here: calibration derives it by
++      probing both bracket endpoints (a noise multiplier decreases
++      privacy-loss metrics; a sample rate or step count increases them).
+     """
+ 
+     value: float
+diff --git a/packages/opaque-accounting/src/opaque/api/accounting/core/calibration.py b/packages/opaque-accounting/src/opaque/api/accounting/core/calibration.py
+index c9e36b696..af2e4f0e1 100644
+--- a/packages/opaque-accounting/src/opaque/api/accounting/core/calibration.py
++++ b/packages/opaque-accounting/src/opaque/api/accounting/core/calibration.py
+@@ -100,15 +100,21 @@ def calibrate(
+ ) -> CalibrateResult:
+     """Binary search for parameter achieving target privacy metric.
+ 
+-    Finds the value of a parameter (e.g., noise_multiplier) such that
+-    the resulting DpProcess achieves a target privacy guarantee.
++    Finds the value of a parameter (e.g. noise_multiplier, sample rate,
++    or step count) such that the resulting DpProcess achieves a target
++    privacy guarantee.
+ 
+     **Metric Direction:**
+-    Each budget declares a ``decreasing`` property that tells the search
+-    whether the metric decreases (True) or increases (False) as the
+-    calibrated parameter grows.  Epsilon/delta/advantage are decreasing;
+-    beta/risk are increasing.  The process metric must be monotone in that
+-    declared direction, as it is when calibrating a noise multiplier.
++    Each budget declares a ``decreasing`` property describing the metric
++    *kind*: privacy-loss metrics (epsilon/delta/advantage) are safe
++    at-or-below the target, privacy-gain metrics (beta/risk) at-or-above.
++    The direction the metric moves as the calibrated *parameter* grows is
++    derived automatically by probing the metric at both endpoints — a
++    noise multiplier decreases privacy-loss metrics while a sample rate
++    or step count increases them, and both directions are supported.  The
++    metric must be monotone in the parameter over ``[param_min,
++    param_max]``; flat or detectably non-monotone parameterizations raise
++    ``ValueError``.
+ 
+     Successful results are one-sided and privacy-safe.  A decreasing
+     privacy-loss metric satisfies ``achieved <= target``; an increasing
+@@ -131,15 +137,16 @@ def calibrate(
+ 
+             Important: If process() raises an exception, it propagates immediately.
+ 
+-        param_min: Lower, unsafe bound for the search
+-            - For decreasing metrics: metric(param_min) >= budget.value
+-            - For increasing metrics: metric(param_min) <= budget.value
+-            - Example: a low noise_multiplier
++        param_min: Lower bound for the search.  Exactly one endpoint of
++            ``[param_min, param_max]`` must be privacy-safe for the
++            target; which one is detected automatically by probing.
++            - Example: a low noise_multiplier (unsafe end), or a low
++              sample rate (safe end)
+ 
+-        param_max: Upper, privacy-safe bound for the search
+-            - For decreasing metrics: metric(param_max) <= budget.value
+-            - For increasing metrics: metric(param_max) >= budget.value
+-            - Example: a high noise_multiplier
++        param_max: Upper bound for the search (see ``param_min`` — the
++            safe endpoint is auto-detected, not positional).
++            - Example: a high noise_multiplier (safe end), or a high
++              sample rate (unsafe end)
+ 
+         tolerance: Positive, finite relative convergence tolerance
+             - Uses ``math.isclose(achieved, target, rel_tol=tolerance, abs_tol=0)``
+@@ -166,8 +173,13 @@ def calibrate(
+     Raises:
+         ValueError: If tolerance is not finite and positive, or max_iterations is not positive
+         ValueError: If param_min >= param_max
+-        ValueError: If bounds don't bracket the target (both val_min/val_max above or below target)
+-        ValueError: If budget evaluation returns inf or nan at the bounds
++        ValueError: If bounds don't bracket the target (neither or both endpoints privacy-safe)
++        ValueError: If budget evaluation returns NaN at the bounds, or infinity
++            on the privacy-safe endpoint (infinity on the unsafe endpoint is
++            accepted — the target is below it by definition)
++        ValueError: If the metric is flat across the bounds, or an interior
++            probe escapes the endpoint value envelope (non-monotone
++            parameterization)
+         RuntimeError: If no privacy-safe endpoint converges within max_iterations
+         Exception: If process() or budget.evaluate() raises an exception
+ 
+@@ -312,52 +324,68 @@ def _calibrate_impl(
+             f"Try expanding the search range or checking that process() produces valid DpProcess objects."
+         )
+ 
+-    # Determine search direction from the budget
+-    decreasing = budget.decreasing
+-    if decreasing:
+-        # metric decreases with param: val_min is high, val_max is low
+-        lo_val, hi_val = val_min, val_max
++    # Metric-kind: privacy-loss metrics (epsilon/delta/advantage) are safe
++    # at-or-below the target; privacy-gain metrics (beta/risk) at-or-above.
++    # This is a property of the METRIC.  The direction the metric moves as
++    # the calibrated PARAMETER grows is derived below by probing both
++    # bracket ends (values already computed above) — noise multipliers make
++    # privacy-loss metrics decrease, but sample rates / step counts make
++    # them increase, and both are valid calibration targets.
++    safe_when_below = budget.decreasing
++
++    def is_safe(achieved: float) -> bool:
++        if safe_when_below:
++            return achieved <= budget.value
++        return achieved >= budget.value
++
++    if val_min == val_max:
++        raise ValueError(
++            f"Metric {budget.name} is flat over param range "
++            f"[{param_min}, {param_max}] (value {val_min} at both ends); "
++            f"cannot infer a monotone search direction. Check that the "
++            f"parameter actually affects the process."
++        )
++    safe_at_max = (val_max < val_min) if safe_when_below else (val_max > val_min)
++
++    if safe_at_max:
++        safe_param, safe_value = param_max, val_max
++        unsafe_param, unsafe_value = param_min, val_min
+     else:
+-        # metric increases with param: val_min is low, val_max is high
+-        lo_val, hi_val = val_max, val_min
++        safe_param, safe_value = param_min, val_min
++        unsafe_param, unsafe_value = param_max, val_max
+ 
+-    # Bracketing check: inf on the "high" side is fine (target < inf),
+-    # but inf on the "low" side means target is unreachable.
+-    if math.isinf(hi_val):
++    # inf on the unsafe endpoint is fine (the target is < inf); inf on the
++    # safe endpoint means the target is unreachable within the bracket.
++    if math.isinf(safe_value):
+         raise ValueError(
+-            f"Budget evaluation returned infinity on the wrong max_norm: "
++            f"Budget evaluation returned infinity on the privacy-safe endpoint: "
+             f"at param_min={param_min}: {val_min}, at param_max={param_max}: {val_max}. "
+-            f"This typically means the privacy target is unreachable with these parameter bounds. "
+-            f"Try expanding the search range or checking that process() produces valid DpProcess objects."
++            f"The privacy target is unreachable with these parameter bounds."
+         )
+-
+-    if not math.isinf(lo_val) and not (hi_val <= budget.value <= lo_val):
++    if not is_safe(safe_value):
+         raise ValueError(
+-            f"Budget {budget.name}={budget.value:.6f} not in range "
+-            f"[{min(val_min, val_max):.6f}, {max(val_min, val_max):.6f}] "
+-            f"for param range [{param_min}, {param_max}]. "
++            f"Budget {budget.name}={budget.value:.6f} not bracketed: neither "
++            f"endpoint of [{param_min}, {param_max}] is privacy-safe "
++            f"(values {val_min:.6f}, {val_max:.6f}). "
+             f"The target may be unreachable with these bounds."
+         )
+-
+-    if math.isinf(lo_val) and budget.value < hi_val:
++    if not math.isinf(unsafe_value) and is_safe(unsafe_value):
+         raise ValueError(
+-            f"Budget {budget.name}={budget.value:.6f} below finite max_norm {hi_val:.6f} "
+-            f"for param range [{param_min}, {param_max}]. "
+-            f"The target may be unreachable with these bounds."
++            f"Budget {budget.name}={budget.value:.6f} not bracketed: both "
++            f"endpoints of [{param_min}, {param_max}] are privacy-safe "
++            f"(values {val_min:.6f}, {val_max:.6f}). If the metric is not "
++            f"monotone in the parameter, calibration is unsupported."
+         )
+ 
+-    def is_safe(achieved: float) -> bool:
+-        if decreasing:
+-            return achieved <= budget.value
+-        return achieved >= budget.value
++    # Monotonicity envelope: any interior probe of a monotone metric stays
++    # inside the endpoint value range; escaping it means the parameterization
++    # is not monotone and bisection would silently mis-calibrate.  Padded by
++    # a small relative tolerance so PLD-grid noise near the endpoints (the
++    # metric's numerical floor) cannot hard-fail a legitimate calibration.
++    env_lo = min(val_min, val_max)
++    env_hi = max(val_min, val_max)
++    env_pad = 1e-9 * max(abs(env_lo), abs(env_hi), 1.0)
+ 
+-    # The existing bracketing contract makes param_max the proven-safe bound.
+-    # Retain its already-evaluated metric so every successful result is safe and
+-    # exhaustion does not require an additional, untracked process evaluation.
+-    lo = param_min
+-    hi = param_max
+-    safe_param = param_max
+-    safe_value = val_max
+     iterations = 0
+ 
+     if math.isclose(
+@@ -376,7 +404,7 @@ def is_safe(achieved: float) -> bool:
+ 
+     for iteration in range(max_iterations):
+         iterations = iteration + 1
+-        mid = (lo + hi) / 2
++        mid = (unsafe_param + safe_param) / 2
+         proc = process(mid)
+         current = budget.evaluate(proc)
+ 
+@@ -387,12 +415,21 @@ def is_safe(achieved: float) -> bool:
+                 f"produces valid DpProcess objects for all parameter values."
+             )
+ 
++        # A monotone metric stays inside the endpoint value envelope.
++        if not math.isinf(current) and not (
++            env_lo - env_pad <= current <= env_hi + env_pad
++        ):
++            raise ValueError(
++                f"Metric {budget.name} is not monotone in the calibrated "
++                f"parameter: value {current:.6f} at param={mid} lies outside "
++                f"the bracket value range [{env_lo:.6f}, {env_hi:.6f}]."
++            )
++
+         if is_safe(current):
+-            hi = mid
+             safe_param = mid
+             safe_value = current
+         else:
+-            lo = mid
++            unsafe_param = mid
+ 
+         # Convergence is accepted only from the proven privacy-safe endpoint.
+         if math.isclose(
+@@ -412,7 +449,8 @@ def is_safe(achieved: float) -> bool:
+     raise RuntimeError(
+         f"Calibration for {budget.name} did not converge: "
+         f"target={budget.value}, relative tolerance={tolerance}, "
+-        f"iterations={iterations}, final bracket=[{lo}, {hi}], "
++        f"iterations={iterations}, "
++        f"final bracket=(unsafe={unsafe_param}, safe={safe_param}), "
+         f"last safe achieved={safe_value} at param={safe_param}."
+     )
+ 

@@ -1,0 +1,543 @@
+diff --git a/doc/source/whatsnew/v3.1.0.rst b/doc/source/whatsnew/v3.1.0.rst
+index 540e49ac11288..53780d518585b 100644
+--- a/doc/source/whatsnew/v3.1.0.rst
++++ b/doc/source/whatsnew/v3.1.0.rst
+@@ -768,6 +768,7 @@ Datetimelike
+ - Bug in :meth:`Series.dt.to_pydatetime` not preserving the original index and name (:issue:`66443`)
+ - Bug in ``day_of_week``, :meth:`Timestamp.weekday` and :meth:`Timestamp.day_name` returning a wrong weekday, or raising ``OverflowError``, for second-resolution datetimes with a year beyond ``2**31`` (:issue:`66549`)
+ - Bug in ``day_of_year`` and ``week``, on :class:`Timestamp` as well as on :class:`DatetimeIndex` and :class:`Series`, taking the leap-year status from a wrapped year for second-resolution datetimes with a year beyond ``2**31`` (:issue:`66549`)
++- Bug in ``np.logical_and``, ``np.logical_or``, ``np.logical_xor`` and ``np.logical_not`` returning a result for datetime-like data -- including the timezone-aware, :class:`PeriodDtype`, :class:`ArrowDtype` and :class:`SparseDtype` spellings, and the corresponding scalars -- instead of raising ``TypeError``; this now also rejects a ``NaT`` scalar against an :class:`ArrowDtype` operand, which ``&`` accepts as a null (:issue:`68524`)
+ - Bug in adding a :class:`BusinessDay` offset to a :class:`DatetimeIndex` or :class:`Series` where an out-of-bounds result silently wrapped to an unrelated date, and a result landing exactly on the ``NaT`` sentinel came back as a missing value, instead of raising ``OverflowError`` (:issue:`66552`)
+ - Bug in adding a :class:`BusinessDay` offset with ``n`` of magnitude ``2**31`` or more to a :class:`DatetimeIndex` or :class:`Series` silently shifting by a wrapped number of business days, e.g. ``n=2**32`` behaving like ``n=0`` (:issue:`66549`)
+ - Bug in adding a :class:`DateOffset` to a :class:`DatetimeIndex` or :class:`Series` where a result landing exactly on the ``NaT`` sentinel came back as a missing value, and where promoting the values to the offset's finer resolution silently wrapped to an unrelated date, instead of raising as the equivalent :class:`Timedelta` operations already did (:issue:`66552`)
+diff --git a/pandas/core/arraylike.py b/pandas/core/arraylike.py
+index 5c960719210fe..1a0c90720258e 100644
+--- a/pandas/core/arraylike.py
++++ b/pandas/core/arraylike.py
+@@ -23,6 +23,7 @@
+ from pandas.core import roperator
+ from pandas.core.construction import extract_array
+ from pandas.core.ops.common import unpack_zerodim_and_defer
++from pandas.core.ops.invalid import disallow_datetimelike_logical_ufunc
+ 
+ REDUCTION_ALIASES = {
+     "maximum": "max",
+@@ -291,6 +292,8 @@ def array_ufunc(self, ufunc: np.ufunc, method: str, *inputs: Any, **kwargs: Any)
+ 
+     cls = type(self)
+ 
++    disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+     kwargs = _standardize_out_kwarg(**kwargs)
+ 
+     # for binary ops, use our custom dunder methods
+diff --git a/pandas/core/arrays/arrow/array.py b/pandas/core/arrays/arrow/array.py
+index 6b4ac2da251f4..fd57bba826b4a 100644
+--- a/pandas/core/arrays/arrow/array.py
++++ b/pandas/core/arrays/arrow/array.py
+@@ -1150,6 +1150,9 @@ def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs, **kwargs):
+                 or pa.types.is_integer(self._pa_array.type)
+             )
+         ):
++            # this branch returns without reaching ExtensionArray.__array_ufunc__
++            ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+             # GH#62506 - when distinguish_nan_and_na is True,
+             # default_array_ufunc converts to numpy via np.asarray which
+             # produces object dtype that most ufuncs can't handle.
+diff --git a/pandas/core/arrays/base.py b/pandas/core/arrays/base.py
+index cccceea3f8c1f..59cc56d688f91 100644
+--- a/pandas/core/arrays/base.py
++++ b/pandas/core/arrays/base.py
+@@ -64,6 +64,7 @@
+ from pandas.core import (
+     arraylike,
+     missing,
++    ops,
+     roperator,
+ )
+ from pandas.core.algorithms import (
+@@ -2953,6 +2954,10 @@ def round(self, decimals: int = 0) -> Self:
+         return type(self)._from_sequence(rounded, dtype=self.dtype)
+ 
+     def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs, **kwargs):
++        # the fallback at the end of this method np.asarray()s the values: M8/m8
++        #  survive to be truth-tested, the rest flatten to object
++        ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+         if any(
+             isinstance(other, (ABCSeries, ABCIndex, ABCDataFrame)) for other in inputs
+         ):
+diff --git a/pandas/core/arrays/masked.py b/pandas/core/arrays/masked.py
+index ca8c0ecb4d3e5..dcaf1bed2930b 100644
+--- a/pandas/core/arrays/masked.py
++++ b/pandas/core/arrays/masked.py
+@@ -842,6 +842,10 @@ def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs, **kwargs):
+         # For MaskedArray inputs, we apply the ufunc to ._data
+         # and mask the result.
+ 
++        # this path never reaches ExtensionArray.__array_ufunc__, and a datetimelike
++        #  scalar is not in _HANDLED_TYPES, so this has to precede that loop
++        ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+         out = kwargs.get("out", ())
+ 
+         for x in inputs + out:
+diff --git a/pandas/core/arrays/numpy_.py b/pandas/core/arrays/numpy_.py
+index 7fc3a7ddd994d..16e60d1096e69 100644
+--- a/pandas/core/arrays/numpy_.py
++++ b/pandas/core/arrays/numpy_.py
+@@ -257,6 +257,10 @@ def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs, **kwargs):
+         # https://numpy.org/doc/stable/reference/generated/numpy.lib.mixins.NDArrayOperatorsMixin.html
+         # The primary modification is not boxing scalar return values
+         # in NumpyExtensionArray, since pandas' ExtensionArrays are 1-d.
++
++        # this path never reaches ExtensionArray.__array_ufunc__
++        ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+         out = kwargs.get("out", ())
+ 
+         result = arraylike.maybe_dispatch_ufunc_to_dunder_op(
+diff --git a/pandas/core/arrays/sparse/array.py b/pandas/core/arrays/sparse/array.py
+index 53f9ec1267b46..b05b34855aa81 100644
+--- a/pandas/core/arrays/sparse/array.py
++++ b/pandas/core/arrays/sparse/array.py
+@@ -2816,6 +2816,10 @@ def argmin(self, skipna: bool = True) -> int:
+     _HANDLED_TYPES = (np.ndarray, numbers.Number)
+ 
+     def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs, **kwargs):
++        # this path never reaches ExtensionArray.__array_ufunc__, and a datetimelike
++        #  scalar is not in _HANDLED_TYPES, so this has to precede that loop
++        ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+         out = kwargs.get("out", ())
+ 
+         for x in inputs + out:
+diff --git a/pandas/core/indexes/base.py b/pandas/core/indexes/base.py
+index bb06ad48469a0..4e2e3b6f7b634 100644
+--- a/pandas/core/indexes/base.py
++++ b/pandas/core/indexes/base.py
+@@ -958,6 +958,10 @@ def __array_ufunc__(
+         if any(isinstance(other, (ABCSeries, ABCDataFrame)) for other in inputs):
+             return NotImplemented
+ 
++        # self._values only reaches the ExtensionArray guard when it is an EA, so a
++        #  bool Index against datetimelike data needs this here
++        ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+         result = arraylike.maybe_dispatch_ufunc_to_dunder_op(
+             self, ufunc, method, *inputs, **kwargs
+         )
+diff --git a/pandas/core/ops/__init__.py b/pandas/core/ops/__init__.py
+index da0932c88923a..0225fbaf52304 100644
+--- a/pandas/core/ops/__init__.py
++++ b/pandas/core/ops/__init__.py
+@@ -24,6 +24,7 @@
+ )
+ from pandas.core.ops.invalid import (
+     disallow_datetimelike_logical_op,
++    disallow_datetimelike_logical_ufunc,
+     invalid_comparison,
+ )
+ from pandas.core.ops.mask_ops import (
+@@ -74,6 +75,7 @@
+     "comp_method_OBJECT_ARRAY",
+     "comparison_op",
+     "disallow_datetimelike_logical_op",
++    "disallow_datetimelike_logical_ufunc",
+     "fill_binop",
+     "get_array_op",
+     "get_op_result_name",
+diff --git a/pandas/core/ops/invalid.py b/pandas/core/ops/invalid.py
+index 76e741659f5ac..f9c698762116c 100644
+--- a/pandas/core/ops/invalid.py
++++ b/pandas/core/ops/invalid.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import datetime
+ import operator
+ from typing import (
+     TYPE_CHECKING,
+@@ -14,17 +15,28 @@
+ import numpy as np
+ 
+ from pandas._libs import lib
++from pandas._libs.missing import NAType
++from pandas._libs.tslibs import (
++    BaseOffset,
++    Period,
++)
+ 
+ from pandas.core.dtypes.dtypes import (
+     ArrowDtype,
+     CategoricalDtype,
+     PeriodDtype,
+ )
++from pandas.core.dtypes.generic import (
++    ABCDataFrame,
++    ABCExtensionArray,
++    ABCIndex,
++    ABCNumpyExtensionArray,
++    ABCSeries,
++)
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Callable
+ 
+-    from pandas._libs.missing import NAType
+     from pandas._typing import (
+         ArrayLike,
+         Scalar,
+@@ -32,6 +44,51 @@
+     )
+ 
+ 
++_LOGICAL_UFUNCS = frozenset(
++    {np.logical_and, np.logical_or, np.logical_xor, np.logical_not}
++)
++
++# Timestamp and NaT subclass datetime.date, Timedelta subclasses datetime.timedelta
++_DATETIMELIKE_SCALARS = (
++    datetime.date,
++    datetime.time,
++    datetime.timedelta,
++    np.datetime64,
++    np.timedelta64,
++    Period,
++    BaseOffset,
++)
++
++# a ufunc against one of these stays inside pandas: every _HANDLED_TYPES contains
++#  np.ndarray, NA matches no ABC (see test_logical_ufunc_na_scalar_datetimelike),
++#  and a pandas operand that one array does defer to re-enters this guard
++_NON_DEFERRING = (
++    np.ndarray,
++    ABCDataFrame,
++    ABCExtensionArray,
++    # NumpyExtensionArray's _typ is not one of ABCExtensionArray's
++    ABCNumpyExtensionArray,
++    ABCIndex,
++    ABCSeries,
++    NAType,
++)
++
++
++def _defers_to(obj: object) -> bool:
++    """
++    Whether a ufunc operand is one pandas hands the operation off to.
++    """
++    array_ufunc = getattr(type(obj), "__array_ufunc__", None)
++    return (
++        array_ufunc is not None
++        and array_ufunc is not np.ndarray.__array_ufunc__
++        # issubclass, not isinstance: the ABCs read `_typ` off whatever they are
++        #  handed, and a symbolic operand answers that with an expression that
++        #  then has no truth value, see test_logical_ufunc_symbolic_operand
++        and not issubclass(type(obj), _NON_DEFERRING)
++    )
++
++
+ def invalid_comparison(
+     left: ArrayLike,
+     right: ArrayLike | list | range | Scalar | NAType,
+@@ -71,12 +128,19 @@ def _is_datetimelike_array(obj: object) -> bool:
+     dtype = getattr(obj, "dtype", None)
+     if dtype is None:
+         return False
+-    if dtype.kind in "biufc":
+-        # no numeric or bool dtype is datetimelike, and logical_op is hot
++    return _is_datetimelike_dtype(dtype)
++
++
++def _is_datetimelike_dtype(dtype: object) -> bool:
++    kind = getattr(dtype, "kind", None)
++    if not isinstance(kind, str) or kind in "biufc":
++        # no numeric or bool dtype is datetimelike, and logical_op is hot.  A
++        #  third-party dtype may have no kind at all, or one that is not a string,
++        #  and must fall through rather than crash, see test_logical_op_third_party
+         return False
+     if isinstance(dtype, CategoricalDtype) and dtype.categories is not None:
+         # a Categorical hides its categories behind kind "O"
+-        dtype = dtype.categories.dtype
++        return _is_datetimelike_dtype(dtype.categories.dtype)
+     if isinstance(dtype, ArrowDtype):
+         import pyarrow as pa
+ 
+@@ -89,7 +153,7 @@ def _is_datetimelike_array(obj: object) -> bool:
+     # kind covers numpy M8/m8 and DatetimeTZDtype; PeriodDtype has kind "O" and needs
+     #  naming.  Plain object dtype is excluded on purpose, see
+     #  test_logical_op_object_dtype_still_truthy
+-    return dtype.kind in "mM" or isinstance(dtype, PeriodDtype)
++    return kind in "mM" or isinstance(dtype, PeriodDtype)
+ 
+ 
+ def _operand_repr(obj: object) -> str:
+@@ -126,6 +190,60 @@ def disallow_datetimelike_logical_op(
+         )
+ 
+ 
++def disallow_datetimelike_logical_ufunc(ufunc: np.ufunc, inputs: tuple) -> None:
++    """
++    Raise TypeError if a logical ufunc is applied to datetimelike data.
++
++    These are not in ``UFUNC_ALIASES`` -- they differ from ``&``/``|``/``^`` on
++    integer data -- so they never reach :func:`disallow_datetimelike_logical_op`
++    and need their own guard.  GH#68524
++
++    Parameters
++    ----------
++    ufunc : numpy.ufunc
++    inputs : tuple
++        The ufunc's operands, which may include DataFrames.
++
++    Raises
++    ------
++    TypeError : if any operand is datetimelike
++    """
++    if ufunc not in _LOGICAL_UFUNCS:
++        return
++
++    if any(_defers_to(obj) for obj in inputs):
++        # pandas defers the whole op, so raising for any operand takes it away,
++        #  see test_logical_ufunc_third_party_datetimelike
++        return
++
++    for obj in inputs:
++        if isinstance(obj, ABCDataFrame):
++            # a DataFrame has no dtype of its own, and with two inputs
++            #  array_ufunc np.asarray()s it before any column-level guard runs.
++            #  Scanned per block rather than per column: this runs on every
++            #  logical ufunc call
++            dtype = next(
++                (
++                    blk.dtype
++                    for blk in obj._mgr.blocks
++                    if _is_datetimelike_dtype(blk.dtype)
++                ),
++                None,
++            )
++            if dtype is None:
++                continue
++            descr = f"with dtype {dtype}"
++        elif _is_datetimelike_array(obj):
++            descr = f"with dtype {obj.dtype}"
++        elif isinstance(obj, _DATETIMELIKE_SCALARS):
++            # GH#68452 left scalar operands to the paths that already rejected
++            #  them for &/|/^; no such path exists on the ufunc side
++            descr = f"of type {type(obj).__name__}"
++        else:
++            continue
++        raise TypeError(f"Object {descr} cannot perform the numpy op {ufunc.__name__}")
++
++
+ def make_invalid_op(name: str) -> Callable[..., NoReturn]:
+     """
+     Return a binary method that always raises a TypeError.
+diff --git a/doc/source/whatsnew/v3.1.0.rst b/doc/source/whatsnew/v3.1.0.rst
+index 0349b87f84b49..5a8905acef951 100644
+--- a/doc/source/whatsnew/v3.1.0.rst
++++ b/doc/source/whatsnew/v3.1.0.rst
+@@ -889,6 +889,7 @@ Conversion
+ - Bug in :class:`DataFrame` constructor where constructing from a list of uniform-dtype arrays (e.g. pyarrow, :class:`CategoricalDtype`, nullable dtypes) lost the dtype (:issue:`49593`)
+ - Bug in :class:`Series` construction and :class:`DataFrame` column assignment from a ``numpy.ma.MaskedArray`` where ``.values`` returned a ``MaskedArray`` instead of a ``ndarray`` (:issue:`65458`)
+ - Bug in :func:`pd.array` silently converting NaN to a nonsensical integer when given float data containing NaN and a NumPy integer dtype (:issue:`41724`)
++- Bug in :func:`pd.array` silently wrapping around instead of raising when converting a nullable integer array to a nullable integer dtype that cannot hold its values (:issue:`55232`)
+ - Bug in :meth:`DataFrame.convert_dtypes` and :meth:`Series.convert_dtypes` converting a float column to ``Int64`` one off from its true value when it held a value equal to ``2**63``, and raising a spurious ``RuntimeWarning`` for other floats outside the ``int64`` range (:issue:`68315`)
+ - Bug in :meth:`DataFrame.convert_dtypes` and :meth:`Series.convert_dtypes` raising ``OverflowError`` for ``object``-dtype data holding integers outside the ``int64``/``uint64`` range; these now retain ``object`` dtype, and data holding both ``NA`` and integers above the ``int64`` range now converts to ``UInt64`` (:issue:`66517`)
+ - Bug in :meth:`Series.astype` to an :class:`ArrowDtype` ``duration`` with a non-nanosecond unit silently returning wrong values (often all zeros) when converting a string column that had been sliced, including the default ``str`` dtype (:issue:`64320`)
+@@ -1040,6 +1041,7 @@ I/O
+ - Fixed bug in :func:`read_csv` and :func:`read_table` where an explicit ``delimiter=None`` was treated as if no separator had been passed, so the default separator was used instead of detecting the separator as ``sep=None`` does (:issue:`47024`)
+ - Fixed bug in :func:`read_csv` where a field containing an embedded NUL byte was parsed as a float from the bytes before the NUL with both the ``c`` and the ``python`` engine, so e.g. ``"1.5\x00xyz"``, ``"1e3\x00xyz"`` and ``"inf\x00xyz"`` were read as ``1.5``, ``1000.0`` and ``inf`` with the trailing bytes silently discarded; such columns are now read as strings (:issue:`66524`)
+ - Fixed bug in :func:`read_csv` where a non-ASCII single-character ``sep`` was handed to the ``c`` engine instead of falling back to the ``python`` engine on platforms whose filesystem encoding is not UTF-8, silently mis-splitting the file or raising ``UnicodeDecodeError`` (:issue:`46456`)
++- Fixed bug in :func:`read_csv` with ``engine="c"`` or ``engine="python"`` where a value outside the range of the requested integer ``dtype`` (e.g. ``-1`` with ``dtype="UInt8"``) was silently wrapped around, or the requested ``dtype`` silently ignored, instead of raising (:issue:`55232`)
+ - Fixed bug in :func:`read_csv` with ``engine="pyarrow"`` where ``names`` was silently ignored when ``header`` was also an integer; ``names`` now replaces the header row, extra leading columns form the index, and passing too many ``names`` raises ``ValueError`` as with the other engines. ``usecols`` together with ``names`` and an integer ``header`` is not supported by this engine and now raises an informative ``ValueError`` (:issue:`65862`)
+ - Fixed bug in :func:`read_csv` with ``engine="pyarrow"`` where ``skiprows`` was silently ignored unless ``header=None``, so the rows meant to be skipped were read as the header and as data; a negative ``skiprows`` now skips nothing as the other engines do, instead of raising ``ParserError`` (:issue:`48507`)
+ - Fixed bug in :func:`read_csv` with ``engine="pyarrow"`` where a ``defaultdict`` passed as ``dtype`` did not apply its default to columns not explicitly listed (:issue:`41574`)
+diff --git a/pandas/_libs/parsers.pyx b/pandas/_libs/parsers.pyx
+index 31ebce4232f40..fa5c3282ffd1b 100644
+--- a/pandas/_libs/parsers.pyx
++++ b/pandas/_libs/parsers.pyx
+@@ -1824,8 +1824,17 @@ cdef class TextReader:
+                                               raise_on_invalid)
+                 na_count = 0
+ 
+-            if result is not None and dtype != "int64":
+-                result = result.astype(dtype)
++            if result is not None and user_dtype and result.dtype != dtype:
++                # GH#55232 gated on user_dtype: inference must keep a uint64
++                #  result from the overflow fallback above, not wrap it into
++                #  the int64 it asked to try.
++                casted = result.astype(dtype)
++                if (casted != result).any():
++                    raise ValueError(
++                        f"cannot safely convert passed user dtype of "
++                        f"{dtype} for {result.dtype.name} dtyped data in "
++                        f"column {i}")
++                result = casted
+ 
+             return result, na_count, na_mask
+ 
+diff --git a/pandas/core/arrays/integer.py b/pandas/core/arrays/integer.py
+index 3cf950b6594a1..3a9bd23ca1c48 100644
+--- a/pandas/core/arrays/integer.py
++++ b/pandas/core/arrays/integer.py
+@@ -59,16 +59,18 @@ def _safe_cast(cls, values: np.ndarray, dtype: np.dtype, copy: bool) -> np.ndarr
+         "safe" in this context means the casting is lossless. e.g. if 'values'
+         has a floating dtype, each value must be an integer.
+         """
+-        try:
+-            return values.astype(dtype, casting="safe", copy=copy)
+-        except TypeError as err:
+-            casted = values.astype(dtype, copy=copy)
+-            if (casted == values).all():
+-                return casted
+-
+-            raise TypeError(
+-                f"cannot safely cast non-equivalent {values.dtype} to {np.dtype(dtype)}"
+-            ) from err
++        if np.can_cast(values.dtype, dtype, casting="safe"):
++            # asked and answered in ~0.2us; raising to find out costs ~5us per
++            #  call, which read_csv pays per column per chunk (GH#55232)
++            return values.astype(dtype, copy=copy)
++
++        casted = values.astype(dtype, copy=copy)
++        if (casted == values).all():
++            return casted
++
++        raise TypeError(
++            f"cannot safely cast non-equivalent {values.dtype} to {np.dtype(dtype)}"
++        )
+ 
+ 
+ @set_module("pandas.arrays")
+diff --git a/pandas/core/arrays/masked.py b/pandas/core/arrays/masked.py
+index 1d122102f47db..8374f057f95cb 100644
+--- a/pandas/core/arrays/masked.py
++++ b/pandas/core/arrays/masked.py
+@@ -437,15 +437,14 @@ def _validate_listlike(self, value) -> tuple[np.ndarray, npt.NDArray[np.bool_]]:
+ 
+         if hasattr(value, "dtype"):
+             their_kind = value.dtype.kind
+-            # Compatible numeric/bool ndarrays defer to _coerce_to_array,
+-            # which handles precision/NaN checks via _safe_cast.  Bool
+-            # ndarrays are accepted for numeric targets to preserve the
+-            # long-standing bool-as-int treatment exercised by Series.mask.
++            # Compatible numeric/bool arrays (ndarray or masked) defer to
++            # _coerce_to_array, which handles precision/NaN checks via
++            # _safe_cast.  Bool values are accepted for numeric targets to
++            # preserve the long-standing bool-as-int treatment exercised by
++            # Series.mask.
+             if (kind == "b" and their_kind == "b") or (
+                 kind in "iuf" and their_kind in "iufb"
+             ):
+-                if kind in "iuf" and isinstance(value, type(self)):
+-                    return self._coerce_same_family(value)
+                 return self._coerce_to_array(value, dtype=self.dtype)
+         elif not is_list_like(value):
+             # is_scalar in __setitem__ misses some non-listlike inputs
+@@ -468,21 +467,8 @@ def _validate_listlike(self, value) -> tuple[np.ndarray, npt.NDArray[np.bool_]]:
+             or (kind in "iuf" and casted_kind in "iuf")
+         ):
+             raise TypeError(f"Invalid value '{value!s}' for dtype '{self.dtype}'")
+-        if kind in "iuf" and isinstance(casted, type(self)):
+-            return self._coerce_same_family(casted)
+         return self._coerce_to_array(casted, dtype=self.dtype)
+ 
+-    def _coerce_same_family(
+-        self, value: BaseMaskedArray
+-    ) -> tuple[np.ndarray, npt.NDArray[np.bool_]]:
+-        # ``value`` is a masked array of the same numeric family as self.
+-        # Coerce its underlying ndarray rather than the masked array itself:
+-        # _coerce_to_array's isinstance fast path would raw-astype and
+-        # silently wrap out-of-bounds values (GH#65510), whereas the ndarray
+-        # takes the general path that rejects a lossy cast via _safe_cast.
+-        data, _ = self._coerce_to_array(value._data, dtype=self.dtype)
+-        return data, value._mask
+-
+     def __setitem__(self, key, value) -> None:
+         if self._readonly:
+             raise ValueError("Cannot modify read-only array")
+diff --git a/pandas/core/arrays/numeric.py b/pandas/core/arrays/numeric.py
+index f9069c5b91b36..7a911d1d167a8 100644
+--- a/pandas/core/arrays/numeric.py
++++ b/pandas/core/arrays/numeric.py
+@@ -151,8 +151,15 @@ def _coerce_to_data_and_mask(values, dtype, copy: bool, dtype_cls: type[NumericD
+     cls = dtype_cls().construct_array_type()
+     if isinstance(values, cls):
+         values, mask = values._data, values._mask
+-        if dtype is not None:
+-            values = values.astype(dtype.numpy_dtype, copy=False)
++        if dtype is not None and values.dtype != dtype.numpy_dtype:
++            if mask.any():
++                # values behind the mask are meaningless, so exclude them from
++                #  the lossiness check below
++                values = values.copy()
++                values[mask] = dtype_cls._internal_fill_value
++            # GH#55232 raise instead of silently wrapping around, matching
++            #  the behavior when constructing from a list or ndarray
++            values = dtype_cls._safe_cast(values, dtype.numpy_dtype, copy=False)
+ 
+         if copy:
+             values = values.copy()
+diff --git a/pandas/io/parsers/python_parser.py b/pandas/io/parsers/python_parser.py
+index 24bf61415d273..26542b1c9b2b6 100644
+--- a/pandas/io/parsers/python_parser.py
++++ b/pandas/io/parsers/python_parser.py
+@@ -562,7 +562,12 @@ def _cast_types(self, values: ArrayLike, cast_type: DtypeObj, column) -> ArrayLi
+                 ) from err
+ 
+         elif isinstance(values, ExtensionArray):
+-            values = values.astype(cast_type, copy=False)
++            casted: ArrayLike = values.astype(cast_type, copy=False)
++            # with dtype_backend="pyarrow", _infer_types has already boxed the
++            #  column, so an explicit numpy integer dtype reaches this branch,
++            #  not the one below
++            _validate_integer_cast(values, casted, cast_type, column)
++            values = casted
+         elif issubclass(cast_type.type, str):
+             # TODO: why skipna=True here and False above? some tests depend
+             #  on it here, but nothing fails if we change it above
+@@ -572,11 +577,13 @@ def _cast_types(self, values: ArrayLike, cast_type: DtypeObj, column) -> ArrayLi
+             )
+         else:
+             try:
+-                values = astype_array(values, cast_type, copy=True)
++                casted = astype_array(values, cast_type, copy=True)
+             except ValueError as err:
+                 raise ValueError(
+                     f"Unable to convert column {column} to type {cast_type}"
+                 ) from err
++            _validate_integer_cast(values, casted, cast_type, column)
++            values = casted
+         return values
+ 
+     @cache_readonly
+@@ -1600,3 +1607,26 @@ def _validate_skipfooter_arg(skipfooter: int) -> int:
+         raise ValueError("skipfooter cannot be negative")
+ 
+     return skipfooter  # pyright: ignore[reportReturnType]
++
++
++def _validate_integer_cast(
++    original: ArrayLike, casted: ArrayLike, cast_type: np.dtype, column
++) -> None:
++    """
++    Raise if casting to an integer dtype wrapped around (GH#55232).
++    """
++    if cast_type.kind not in "iu" or original.dtype.kind not in "iuf":
++        return
++    values = np.asarray(original)
++    if np.can_cast(values.dtype, cast_type):
++        return
++    if values.dtype.kind == "f":
++        # discarding a float's fractional part is not wraparound and stays
++        #  allowed (see test_read_fwf.py::test_dtype)
++        values = np.trunc(values)
++    if (np.asarray(casted) != values).any():
++        raise ValueError(
++            f"cannot safely convert passed user dtype of "
++            f"{cast_type} for {values.dtype.name} dtyped data in "
++            f"column {column}"
++        )

@@ -1,0 +1,384 @@
+diff --git a/tests/client/telemetry/test_client_tracing.py b/tests/client/telemetry/test_client_tracing.py
+index 309ec3af..54c4c08f 100644
+--- a/tests/client/telemetry/test_client_tracing.py
++++ b/tests/client/telemetry/test_client_tracing.py
+@@ -63,12 +63,50 @@ class TestClientToolTracing:
+         assert client_span.attributes is not None
+         # Standard MCP semantic conventions
+         assert client_span.attributes["mcp.method.name"] == "tools/call"
+-        # Standard RPC semantic conventions
+-        assert client_span.attributes["rpc.system"] == "mcp"
+-        assert client_span.attributes["rpc.method"] == "tools/call"
++        # gen_ai semantic conventions
++        assert client_span.attributes["gen_ai.tool.name"] == "add"
++        # RPC attributes must NOT be present
++        assert "rpc.system" not in client_span.attributes
++        assert "rpc.method" not in client_span.attributes
+         # FastMCP-specific attributes
+         assert client_span.attributes["fastmcp.component.key"] == "add"
+ 
++    async def test_call_tool_error_caught_by_client_span(
++        self, trace_exporter: InMemorySpanExporter
++    ):
++        """Tool error should be reflected on the client span via isError check."""
++        server = FastMCP("test-server")
++
++        @server.tool()
++        def failing_tool() -> str:
++            raise ValueError("boom")
++
++        client = Client(server)
++        async with client:
++            with pytest.raises(ToolError):
++                await client.call_tool("failing_tool", {})
++
++        spans = trace_exporter.get_finished_spans()
++
++        # Find the client span (from call_tool_mcp)
++        client_spans = [
++            s
++            for s in spans
++            if s.name == "tools/call failing_tool"
++            and s.attributes is not None
++            and "fastmcp.server.name" not in s.attributes
++        ]
++
++        # Exactly one client span should exist (no duplicate from call_tool)
++        assert len(client_spans) == 1, (
++            "There should be exactly one client span for call_tool"
++        )
++
++        error_span = client_spans[0]
++        assert error_span.status.status_code == StatusCode.ERROR
++        assert error_span.attributes is not None
++        assert error_span.attributes["error.type"] == "tool_error"
++
+ 
+ class TestClientResourceTracing:
+     """Tests for client resource read tracing."""
+@@ -90,8 +128,8 @@ class TestClientResourceTracing:
+         spans = trace_exporter.get_finished_spans()
+         span_names = [s.name for s in spans]
+ 
+-        # Client should create "resources/read data://config" span
+-        assert "resources/read data://config" in span_names
++        # Client should create "resources/read" span (URI in attributes, not name)
++        assert "resources/read" in span_names
+ 
+     async def test_read_resource_span_attributes(
+         self, trace_exporter: InMemorySpanExporter
+@@ -113,7 +151,7 @@ class TestClientResourceTracing:
+             (
+                 s
+                 for s in spans
+-                if s.name.startswith("resources/read data://")
++                if s.name == "resources/read"
+                 and s.attributes is not None
+                 and "fastmcp.server.name" not in s.attributes
+             ),
+@@ -124,9 +162,9 @@ class TestClientResourceTracing:
+         # Standard MCP semantic conventions
+         assert client_span.attributes["mcp.method.name"] == "resources/read"
+         assert "data://" in str(client_span.attributes["mcp.resource.uri"])
+-        # Standard RPC semantic conventions
+-        assert client_span.attributes["rpc.system"] == "mcp"
+-        assert client_span.attributes["rpc.method"] == "resources/read"
++        # RPC attributes must NOT be present
++        assert "rpc.system" not in client_span.attributes
++        assert "rpc.method" not in client_span.attributes
+         # FastMCP-specific attributes
+         # The URI may be normalized with trailing slash
+         assert "data://" in str(client_span.attributes["fastmcp.component.key"])
+@@ -183,9 +221,11 @@ class TestClientPromptTracing:
+         assert client_span.attributes is not None
+         # Standard MCP semantic conventions
+         assert client_span.attributes["mcp.method.name"] == "prompts/get"
+-        # Standard RPC semantic conventions
+-        assert client_span.attributes["rpc.system"] == "mcp"
+-        assert client_span.attributes["rpc.method"] == "prompts/get"
++        # gen_ai semantic conventions
++        assert client_span.attributes["gen_ai.prompt.name"] == "welcome"
++        # RPC attributes must NOT be present
++        assert "rpc.system" not in client_span.attributes
++        assert "rpc.method" not in client_span.attributes
+         # FastMCP-specific attributes
+         assert client_span.attributes["fastmcp.component.key"] == "welcome"
+ 
+@@ -242,7 +282,7 @@ class TestClientServerSpanHierarchy:
+         assert server_span.kind == SpanKind.SERVER, "Server span should be SERVER kind"
+ 
+         # Verify the spans have different characteristics
+-        assert client_span.attributes["rpc.method"] == "tools/call"
++        assert client_span.attributes["mcp.method.name"] == "tools/call"
+         assert server_span.attributes["fastmcp.server.name"] == "test-server"
+ 
+     async def test_trace_context_propagation(
+@@ -380,7 +420,7 @@ class TestClientErrorTracing:
+             (
+                 s
+                 for s in spans
+-                if s.name.startswith("resources/read data://fail")
++                if s.name == "resources/read"
+                 and s.attributes is not None
+                 and "fastmcp.server.name" not in s.attributes
+             ),
+@@ -391,7 +431,7 @@ class TestClientErrorTracing:
+             (
+                 s
+                 for s in spans
+-                if s.name.startswith("resources/read data://fail")
++                if s.name == "resources/read"
+                 and s.attributes is not None
+                 and "fastmcp.server.name" in s.attributes
+             ),
+diff --git a/tests/server/mount/test_mount.py b/tests/server/mount/test_mount.py
+index 1850a3d2..3c2d0edd 100644
+--- a/tests/server/mount/test_mount.py
++++ b/tests/server/mount/test_mount.py
+@@ -300,18 +300,19 @@ class TestMultipleServerMount:
+             prompt_names = [prompt.name for prompt in prompts]
+             assert "working_working_prompt" in prompt_names
+ 
+-        # Verify that errors were logged for the unreachable provider (at DEBUG level)
+-        debug_messages = [
+-            record.message for record in caplog.records if record.levelname == "DEBUG"
++        # Verify that errors were logged for the unreachable provider (at WARNING level)
++        warning_messages = [
++            record.message for record in caplog.records if record.levelname == "WARNING"
+         ]
+         assert any(
+-            "Error during list_tools from provider" in msg for msg in debug_messages
++            "Error during list_tools from provider" in msg for msg in warning_messages
+         )
+         assert any(
+-            "Error during list_resources from provider" in msg for msg in debug_messages
++            "Error during list_resources from provider" in msg
++            for msg in warning_messages
+         )
+         assert any(
+-            "Error during list_prompts from provider" in msg for msg in debug_messages
++            "Error during list_prompts from provider" in msg for msg in warning_messages
+         )
+ 
+ 
+@@ -540,3 +541,111 @@ class TestPrefixConflictResolution:
+         assert result.messages is not None
+         assert isinstance(result.messages[0].content, TextContent)
+         assert result.messages[0].content.text == "First app prompt"
++
++
++class TestCrossProviderDuplicateDetection:
++    """Test that on_duplicate catches duplicates across mounted providers."""
++
++    async def test_on_duplicate_error_raises_for_same_namespace(self):
++        """Mounting two servers with the same namespace and tool name raises."""
++        main = FastMCP("Main", on_duplicate="error")
++        sub1 = FastMCP("Sub1")
++        sub2 = FastMCP("Sub2")
++
++        @sub1.tool(name="greet")
++        def greet_v1() -> str:
++            return "from sub1"
++
++        @sub2.tool(name="greet")
++        def greet_v2() -> str:
++            return "from sub2"
++
++        main.mount(sub1, "ns")
++        main.mount(sub2, "ns")
++
++        with pytest.raises(ValueError, match="Duplicate"):
++            await main.list_tools()
++
++    async def test_on_duplicate_warn_logs_for_same_namespace(self, caplog):
++        """Mounting with on_duplicate='warn' logs a warning instead of raising."""
++        main = FastMCP("Main", on_duplicate="warn")
++        sub1 = FastMCP("Sub1")
++        sub2 = FastMCP("Sub2")
++
++        @sub1.tool(name="greet")
++        def greet_w1() -> str:
++            return "from sub1"
++
++        @sub2.tool(name="greet")
++        def greet_w2() -> str:
++            return "from sub2"
++
++        main.mount(sub1, "ns")
++        main.mount(sub2, "ns")
++
++        caplog.set_level(logging.WARNING, logger="fastmcp")
++        tools = await main.list_tools()
++        assert len([t for t in tools if t.name == "ns_greet"]) == 2
++        assert any("Duplicate" in r.message for r in caplog.records)
++
++    async def test_no_false_positive_for_different_names(self):
++        """Different tool names in the same namespace don't trigger duplicate."""
++        main = FastMCP("Main", on_duplicate="error")
++        sub1 = FastMCP("Sub1")
++        sub2 = FastMCP("Sub2")
++
++        @sub1.tool
++        def tool_a() -> str:
++            return "a"
++
++        @sub2.tool
++        def tool_b() -> str:
++            return "b"
++
++        main.mount(sub1, "ns")
++        main.mount(sub2, "ns")
++
++        tools = await main.list_tools()
++        assert len(tools) == 2
++
++
++class TestMaskErrorDetailsMismatchWarning:
++    """Test that mismatched mask_error_details is warned about at mount time."""
++
++    async def test_warns_when_parent_masked_child_not(self, caplog):
++        """Mounting an unmasked child into a masked parent logs a warning."""
++        caplog.set_level(logging.WARNING, logger="fastmcp")
++        parent = FastMCP("parent", mask_error_details=True)
++        child = FastMCP("child")
++
++        @child.tool
++        def my_tool() -> str:
++            return "ok"
++
++        parent.mount(child, "ns")
++        assert any("mask_error_details" in r.message for r in caplog.records)
++
++    async def test_no_warning_when_both_masked(self, caplog):
++        """No warning when both parent and child have masking enabled."""
++        caplog.set_level(logging.WARNING, logger="fastmcp")
++        parent = FastMCP("parent", mask_error_details=True)
++        child = FastMCP("child", mask_error_details=True)
++
++        @child.tool
++        def my_tool() -> str:
++            return "ok"
++
++        parent.mount(child, "ns")
++        assert not any("mask_error_details" in r.message for r in caplog.records)
++
++    async def test_child_not_mutated_by_mount(self):
++        """Mounting should not mutate the child server's mask setting."""
++        parent = FastMCP("parent", mask_error_details=True)
++        child = FastMCP("child")
++
++        @child.tool
++        def my_tool() -> str:
++            return "ok"
++
++        parent.mount(child, "ns")
++        assert child._mask_error_details is False
+diff --git a/tests/server/telemetry/test_server_tracing.py b/tests/server/telemetry/test_server_tracing.py
+index 1d110eff..2b98ae6c 100644
+--- a/tests/server/telemetry/test_server_tracing.py
++++ b/tests/server/telemetry/test_server_tracing.py
+@@ -33,10 +33,12 @@ class TestToolTracing:
+         assert span.attributes is not None
+         # Standard MCP semantic conventions
+         assert span.attributes["mcp.method.name"] == "tools/call"
+-        # Standard RPC semantic conventions
+-        assert span.attributes["rpc.system"] == "mcp"
+-        assert span.attributes["rpc.service"] == "test-server"
+-        assert span.attributes["rpc.method"] == "tools/call"
++        # gen_ai semantic conventions
++        assert span.attributes["gen_ai.tool.name"] == "greet"
++        # RPC attributes must NOT be present
++        assert "rpc.system" not in span.attributes
++        assert "rpc.service" not in span.attributes
++        assert "rpc.method" not in span.attributes
+         # FastMCP-specific attributes
+         assert span.attributes["fastmcp.server.name"] == "test-server"
+         assert span.attributes["fastmcp.component.type"] == "tool"
+@@ -60,6 +62,10 @@ class TestToolTracing:
+         span = spans[0]
+         assert span.name == "tools/call failing_tool"
+         assert span.status.status_code == StatusCode.ERROR
++        assert span.status.description is not None
++        assert "Something went wrong" in span.status.description
++        assert span.attributes is not None
++        assert span.attributes["error.type"] == "tool_error"
+         assert len(span.events) > 0  # Exception recorded
+ 
+     async def test_call_nonexistent_tool_sets_error(
+@@ -76,6 +82,9 @@ class TestToolTracing:
+         span = spans[0]
+         assert span.name == "tools/call nonexistent"
+         assert span.status.status_code == StatusCode.ERROR
++        assert span.attributes is not None
++        # NotFoundError is not a ToolError, so uses class name as fallback
++        assert span.attributes["error.type"] == "NotFoundError"
+ 
+ 
+ class TestResourceTracing:
+@@ -95,16 +104,16 @@ class TestResourceTracing:
+         assert len(spans) == 1
+ 
+         span = spans[0]
+-        assert span.name == "resources/read config://app"
++        assert span.name == "resources/read"
+         assert span.kind == SpanKind.SERVER
+         assert span.attributes is not None
+         # Standard MCP semantic conventions
+         assert span.attributes["mcp.method.name"] == "resources/read"
+         assert span.attributes["mcp.resource.uri"] == "config://app"
+-        # Standard RPC semantic conventions
+-        assert span.attributes["rpc.system"] == "mcp"
+-        assert span.attributes["rpc.service"] == "test-server"
+-        assert span.attributes["rpc.method"] == "resources/read"
++        # RPC attributes must NOT be present
++        assert "rpc.system" not in span.attributes
++        assert "rpc.service" not in span.attributes
++        assert "rpc.method" not in span.attributes
+         # FastMCP-specific attributes
+         assert span.attributes["fastmcp.server.name"] == "test-server"
+         assert span.attributes["fastmcp.component.type"] == "resource"
+@@ -126,14 +135,15 @@ class TestResourceTracing:
+         assert len(spans) == 1
+ 
+         span = spans[0]
+-        assert span.name == "resources/read users://123/profile"
++        assert span.name == "resources/read"
+         assert span.kind == SpanKind.SERVER
+         assert span.attributes is not None
+         # Standard MCP semantic conventions
+         assert span.attributes["mcp.method.name"] == "resources/read"
+         assert span.attributes["mcp.resource.uri"] == "users://123/profile"
+-        # Standard RPC semantic conventions
+-        assert span.attributes["rpc.method"] == "resources/read"
++        # RPC attributes must NOT be present
++        assert "rpc.system" not in span.attributes
++        assert "rpc.method" not in span.attributes
+         # Template component type is set by get_span_attributes
+         assert span.attributes["fastmcp.component.type"] == "resource_template"
+         assert (
+@@ -153,7 +163,7 @@ class TestResourceTracing:
+         assert len(spans) == 1
+ 
+         span = spans[0]
+-        assert span.name == "resources/read nonexistent://resource"
++        assert span.name == "resources/read"
+         assert span.status.status_code == StatusCode.ERROR
+ 
+ 
+@@ -179,10 +189,12 @@ class TestPromptTracing:
+         assert span.attributes is not None
+         # Standard MCP semantic conventions
+         assert span.attributes["mcp.method.name"] == "prompts/get"
+-        # Standard RPC semantic conventions
+-        assert span.attributes["rpc.system"] == "mcp"
+-        assert span.attributes["rpc.service"] == "test-server"
+-        assert span.attributes["rpc.method"] == "prompts/get"
++        # gen_ai semantic conventions
++        assert span.attributes["gen_ai.prompt.name"] == "greeting"
++        # RPC attributes must NOT be present
++        assert "rpc.system" not in span.attributes
++        assert "rpc.service" not in span.attributes
++        assert "rpc.method" not in span.attributes
+         # FastMCP-specific attributes
+         assert span.attributes["fastmcp.server.name"] == "test-server"
+         assert span.attributes["fastmcp.component.type"] == "prompt"

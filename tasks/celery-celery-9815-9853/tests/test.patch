@@ -1,0 +1,251 @@
+diff --git a/t/unit/app/test_amqp.py b/t/unit/app/test_amqp.py
+index 4b46148d1..db15c343a 100644
+--- a/t/unit/app/test_amqp.py
++++ b/t/unit/app/test_amqp.py
+@@ -134,6 +134,15 @@ class test_Queues:
+         queues.add(q)
+         assert queues[qname].queue_arguments == expected
+ 
++    def test_missing_queue_quorum(self):
++        queues = Queues(create_missing_queue_type="quorum",
++                        create_missing_queue_exchange_type="topic")
++
++        q = queues.new_missing("spontaneous")
++        assert q.name == "spontaneous"
++        assert q.queue_arguments == {"x-queue-type": "quorum"}
++        assert q.exchange.type == "topic"
++
+ 
+ class test_default_queues:
+ 
+@@ -360,6 +369,22 @@ class test_AMQP(test_AMQP_Base):
+         router = self.app.amqp.router
+         assert router != router_was
+ 
++    def test_create_missing_queue_type_from_conf(self):
++        self.app.conf.task_create_missing_queue_type = "quorum"
++        self.app.conf.task_create_missing_queue_exchange_type = "topic"
++        self.app.amqp.__dict__.pop("queues", None)
++        q = self.app.amqp.queues["auto"]
++        assert q.queue_arguments == {"x-queue-type": "quorum"}
++        assert q.exchange.type == "topic"
++
++    def test_create_missing_queue_type_explicit_param(self):
++        qmap = self.app.amqp.Queues({}, create_missing=True,
++                                    create_missing_queue_type="quorum",
++                                    create_missing_queue_exchange_type="topic")
++        q = qmap["auto"]
++        assert q.queue_arguments == {"x-queue-type": "quorum"}
++        assert q.exchange.type == "topic"
++
+ 
+ class test_as_task_v2(test_AMQP_Base):
+ 
+diff --git a/t/unit/app/test_control.py b/t/unit/app/test_control.py
+index 0908491a9..4916880a4 100644
+--- a/t/unit/app/test_control.py
++++ b/t/unit/app/test_control.py
+@@ -4,7 +4,7 @@ import pytest
+ 
+ from celery import uuid
+ from celery.app import control
+-from celery.exceptions import DuplicateNodenameWarning
++from celery.exceptions import DuplicateNodenameWarning, ImproperlyConfigured
+ from celery.utils.collections import LimitedSet
+ 
+ 
+@@ -291,6 +291,7 @@ class test_Control:
+             self.mytask.name, soft=10, hard=20,
+             destination='a@q.com', limit=99,
+         )
++
+         self.assert_control_called_with_args(
+             'time_limit',
+             destination='a@q.com',
+@@ -564,3 +565,18 @@ class test_Control:
+         self.app.conf.control_exchange = 'test_exchange'
+         c = control.Control(self.app)
+         assert c.mailbox.namespace == 'test_exchange'
++
++    def test_control_mailbox_queue_options(self):
++        self.app.conf.control_queue_durable = True
++        self.app.conf.control_queue_exclusive = False
++
++        c = control.Control(self.app)
++        assert c.mailbox.queue_durable is True
++        assert c.mailbox.queue_exclusive is False
++
++    def test_control_mailbox_invalid_combination(self):
++        self.app.conf.control_queue_durable = True
++        self.app.conf.control_queue_exclusive = True
++
++        with pytest.raises(ImproperlyConfigured):
++            control.Control(self.app)
+diff --git a/t/unit/events/test_events.py b/t/unit/events/test_events.py
+index 21fcc5003..ae2c4e493 100644
+--- a/t/unit/events/test_events.py
++++ b/t/unit/events/test_events.py
+@@ -5,6 +5,7 @@ import pytest
+ 
+ from celery.events import Event
+ from celery.events.receiver import CLIENT_CLOCK_SKEW
++from celery.exceptions import ImproperlyConfigured
+ 
+ 
+ class MockProducer:
+@@ -327,6 +328,39 @@ class test_EventReceiver:
+             channel.close()
+             connection.close()
+ 
++    def test_event_queue_exclusive(self):
++        self.app.conf.update(
++            event_queue_exclusive=True,
++            event_queue_durable=False
++        )
++
++        ev_recv = self.app.events.Receiver(Mock(name='connection'))
++        q = ev_recv.queue
++
++        assert q.exclusive is True
++        assert q.durable is False
++        assert q.auto_delete is True
++
++    def test_event_queue_durable_and_validation(self):
++        self.app.conf.update(
++            event_queue_exclusive=False,
++            event_queue_durable=True
++        )
++        ev_recv = self.app.events.Receiver(Mock(name='connection'))
++        q = ev_recv.queue
++
++        assert q.durable is True
++        assert q.exclusive is False
++        assert q.auto_delete is False
++
++        self.app.conf.update(
++            event_queue_exclusive=True,
++            event_queue_durable=True
++        )
++
++        with pytest.raises(ImproperlyConfigured):
++            self.app.events.Receiver(Mock(name='connection'))
++
+ 
+ def test_State(app):
+     state = app.events.State()
+diff --git a/t/unit/worker/test_consumer.py b/t/unit/worker/test_consumer.py
+index 04d167e3d..1805e5815 100644
+--- a/t/unit/worker/test_consumer.py
++++ b/t/unit/worker/test_consumer.py
+@@ -706,6 +706,72 @@ class test_Tasks:
+         assert record.levelname == "INFO"
+         assert record.msg == "Global QoS is disabled. Prefetch count in now static."
+ 
++    def test_qos_with_worker_eta_task_limit(self):
++        """Test QoS is instantiated with worker_eta_task_limit as max_prefetch."""
++        c = self.c
++        c.app.conf.worker_eta_task_limit = 100
++        c.initial_prefetch_count = 10
++        c.task_consumer = Mock()
++        c.app.amqp.TaskConsumer = Mock(return_value=c.task_consumer)
++        c.connection.default_channel.basic_qos = Mock()
++        c.update_strategies = Mock()
++        c.on_decode_error = Mock()
++
++        tasks = Tasks(c)
++
++        with patch('celery.worker.consumer.tasks.QoS') as mock_qos:
++            tasks.start(c)
++
++            # Verify QoS was called with max_prefetch set to worker_eta_task_limit
++            mock_qos.assert_called_once()
++            args, kwargs = mock_qos.call_args
++            assert len(args) == 2  # callback and initial_value
++            assert kwargs.get('max_prefetch') == 100
++
++    def test_qos_without_worker_eta_task_limit(self):
++        """Test QoS is instantiated with None max_prefetch when worker_eta_task_limit is None."""
++        c = self.c
++        c.app.conf.worker_eta_task_limit = None
++        c.initial_prefetch_count = 10
++        c.task_consumer = Mock()
++        c.app.amqp.TaskConsumer = Mock(return_value=c.task_consumer)
++        c.connection.default_channel.basic_qos = Mock()
++        c.update_strategies = Mock()
++        c.on_decode_error = Mock()
++
++        tasks = Tasks(c)
++
++        with patch('celery.worker.consumer.tasks.QoS') as mock_qos:
++            tasks.start(c)
++
++            # Verify QoS was called with max_prefetch set to None
++            mock_qos.assert_called_once()
++            args, kwargs = mock_qos.call_args
++            assert len(args) == 2  # callback and initial_value
++            assert kwargs.get('max_prefetch') is None
++
++    def test_qos_with_zero_worker_eta_task_limit(self):
++        """Test that QoS respects zero as a valid worker_eta_task_limit value."""
++        c = self.c
++        c.app.conf.worker_eta_task_limit = 0
++        c.initial_prefetch_count = 10
++        c.task_consumer = Mock()
++        c.app.amqp.TaskConsumer = Mock(return_value=c.task_consumer)
++        c.connection.default_channel.basic_qos = Mock()
++        c.update_strategies = Mock()
++        c.on_decode_error = Mock()
++
++        tasks = Tasks(c)
++
++        with patch('celery.worker.consumer.tasks.QoS') as mock_qos:
++            tasks.start(c)
++
++            # Verify QoS was called with max_prefetch set to 0
++            mock_qos.assert_called_once()
++            args, kwargs = mock_qos.call_args
++            assert len(args) == 2  # callback and initial_value
++            assert kwargs.get('max_prefetch') == 0
++
+ 
+ class test_Agent:
+ 
+diff --git a/t/unit/worker/test_strategy.py b/t/unit/worker/test_strategy.py
+index 30c50b984..b2b829c4f 100644
+--- a/t/unit/worker/test_strategy.py
++++ b/t/unit/worker/test_strategy.py
+@@ -1,5 +1,4 @@
+ import logging
+-from collections import defaultdict
+ from contextlib import contextmanager
+ from unittest.mock import ANY, Mock, patch
+ 
+@@ -99,8 +98,8 @@ class test_default_strategy_proto2:
+             assert not self.was_reserved()
+             called = self.consumer.timer.call_at.called
+             if called:
+-                assert self.consumer.timer.call_at.call_args[0][1] == \
+-                    self.consumer._limit_post_eta
++                callback = self.consumer.timer.call_at.call_args[0][1]
++                assert callback == self.consumer._limit_post_eta
+             return called
+ 
+         def was_scheduled(self):
+@@ -128,10 +127,15 @@ class test_default_strategy_proto2:
+ 
+         reserved = Mock()
+         consumer = Mock()
+-        consumer.task_buckets = defaultdict(lambda: None)
++        # Create a proper mock for task_buckets that supports __getitem__
++        task_buckets_mock = Mock()
++        task_buckets_mock.__getitem__ = Mock(side_effect=lambda key: None)
++        consumer.task_buckets = task_buckets_mock
+         if limit:
+             bucket = TokenBucket(rate(limit), capacity=1)
+-            consumer.task_buckets[sig.task] = bucket
++            task_buckets_mock.__getitem__.side_effect = (
++                lambda key: bucket if key == sig.task else None
++            )
+         consumer.controller.state.revoked = set()
+         consumer.disable_rate_limits = not rate_limits
+         consumer.event_dispatcher.enabled = events

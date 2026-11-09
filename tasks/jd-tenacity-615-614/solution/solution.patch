@@ -1,0 +1,136 @@
+diff --git a/tenacity/__init__.py b/tenacity/__init__.py
+index 591f9703..dd4eb480 100644
+--- a/tenacity/__init__.py
++++ b/tenacity/__init__.py
+@@ -291,6 +291,14 @@ def copy(
+             enabled=_first_set(enabled, self.enabled),
+         )
+ 
++    def __getstate__(self) -> dict[str, t.Any]:
++        # Exclude threading.local which cannot be pickled
++        return {k: v for k, v in self.__dict__.items() if k != "_local"}
++
++    def __setstate__(self, state: dict[str, t.Any]) -> None:
++        self.__dict__.update(state)
++        self._local = threading.local()
++
+     def __str__(self) -> str:
+         return self._name if self._name is not None else "<unknown>"
+ 
+diff --git a/tenacity/retry.py b/tenacity/retry.py
+index 6e9fc3e8..df0cc4d6 100644
+--- a/tenacity/retry.py
++++ b/tenacity/retry.py
+@@ -108,7 +108,10 @@ def __init__(
+         | tuple[type[BaseException], ...] = Exception,
+     ) -> None:
+         self.exception_types = exception_types
+-        super().__init__(lambda e: isinstance(e, exception_types))
++        super().__init__(self._check)
++
++    def _check(self, e: BaseException) -> bool:
++        return isinstance(e, self.exception_types)
+ 
+ 
+ class retry_if_not_exception_type(retry_if_exception):
+@@ -120,7 +123,10 @@ def __init__(
+         | tuple[type[BaseException], ...] = Exception,
+     ) -> None:
+         self.exception_types = exception_types
+-        super().__init__(lambda e: not isinstance(e, exception_types))
++        super().__init__(self._check)
++
++    def _check(self, e: BaseException) -> bool:
++        return not isinstance(e, self.exception_types)
+ 
+ 
+ class retry_unless_exception_type(retry_if_exception):
+@@ -132,7 +138,10 @@ def __init__(
+         | tuple[type[BaseException], ...] = Exception,
+     ) -> None:
+         self.exception_types = exception_types
+-        super().__init__(lambda e: not isinstance(e, exception_types))
++        super().__init__(self._check)
++
++    def _check(self, e: BaseException) -> bool:
++        return not isinstance(e, self.exception_types)
+ 
+     def __call__(self, retry_state: "RetryCallState") -> bool:
+         if retry_state.outcome is None:
+@@ -219,40 +228,27 @@ def __init__(
+                 f"{self.__class__.__name__}() takes either 'message' or 'match', not both"
+             )
+ 
+-        # set predicate
+-        if message:
+-
+-            def message_fnc(exception: BaseException) -> bool:
+-                return message == str(exception)
+-
+-            predicate = message_fnc
+-        elif match:
+-            prog = re.compile(match)
+-
+-            def match_fnc(exception: BaseException) -> bool:
+-                return bool(prog.match(str(exception)))
+-
+-            predicate = match_fnc
+-        else:
++        if not message and not match:
+             raise TypeError(
+                 f"{self.__class__.__name__}() missing 1 required argument 'message' or 'match'"
+             )
+ 
+-        super().__init__(predicate)
++        self.message = message
++        self.match = re.compile(match) if match else None
++        super().__init__(self._check)
++
++    def _check(self, exception: BaseException) -> bool:
++        if self.message:
++            return self.message == str(exception)
++        assert self.match is not None
++        return bool(self.match.match(str(exception)))
+ 
+ 
+ class retry_if_not_exception_message(retry_if_exception_message):
+     """Retries until an exception message equals or matches."""
+ 
+-    def __init__(
+-        self,
+-        message: str | None = None,
+-        match: None | str | re.Pattern[str] = None,
+-    ) -> None:
+-        super().__init__(message, match)
+-        # invert predicate
+-        if_predicate = self.predicate
+-        self.predicate = lambda *args_, **kwargs_: not if_predicate(*args_, **kwargs_)
++    def _check(self, exception: BaseException) -> bool:
++        return not super()._check(exception)
+ 
+     def __call__(self, retry_state: "RetryCallState") -> bool:
+         if retry_state.outcome is None:
+diff --git a/tenacity/__init__.py b/tenacity/__init__.py
+index dd4eb480..c6484a82 100644
+--- a/tenacity/__init__.py
++++ b/tenacity/__init__.py
+@@ -362,6 +362,7 @@ def wrapped_f(*args: t.Any, **kw: t.Any) -> t.Any:
+             # calling the same wrapped functions multiple times in the same stack
+             copy = self.copy()
+             wrapped_f.statistics = copy.statistics  # type: ignore[attr-defined]
++            self._local.statistics = copy.statistics
+             return copy(f, *args, **kw)
+ 
+         def retry_with(*args: t.Any, **kwargs: t.Any) -> "_RetryDecorated[P, R]":
+diff --git a/tenacity/asyncio/__init__.py b/tenacity/asyncio/__init__.py
+index 0ff48855..b2b203e3 100644
+--- a/tenacity/asyncio/__init__.py
++++ b/tenacity/asyncio/__init__.py
+@@ -197,6 +197,7 @@ async def async_wrapped(*args: t.Any, **kwargs: t.Any) -> t.Any:
+             # calling the same wrapped functions multiple times in the same stack
+             copy = self.copy()
+             async_wrapped.statistics = copy.statistics  # type: ignore[attr-defined]
++            self._local.statistics = copy.statistics
+             return await copy(fn, *args, **kwargs)  # type: ignore[type-var]
+ 
+         # Preserve attributes

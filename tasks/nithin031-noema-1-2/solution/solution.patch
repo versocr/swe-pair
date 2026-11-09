@@ -1,0 +1,481 @@
+diff --git a/src/noema/api/server.py b/src/noema/api/server.py
+index 228bf3d..7a36031 100644
+--- a/src/noema/api/server.py
++++ b/src/noema/api/server.py
+@@ -28,6 +28,9 @@ def _json_bytes(payload: Any) -> bytes:
+     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+ 
+ 
++_request_local = threading.local()
++
++
+ class NoemaApp:
+     """Local-only HTTP surface around ``NoemaService``.
+ 
+@@ -44,6 +47,26 @@ def __init__(self, service: NoemaService, daemon: Any = None):
+         self._source_today_cache = None
+         self._source_today_cached_at = 0.0
+ 
++    @staticmethod
++    def _cors_origin() -> str:
++        """Return the Access-Control-Allow-Origin value for the current request.
++
++        Only localhost, loopback, and browser-extension origins are
++        reflected back verbatim.  All other origins get the loopback
++        default.  The current request environ is read from the
++        per-thread local set in ``__call__``.
++        """
++        environ = getattr(_request_local, "environ", None) or {}
++        origin = environ.get("HTTP_ORIGIN", "")
++        if origin and (
++            origin.startswith("http://localhost")
++            or origin.startswith("http://127.0.0.1")
++            or origin.startswith("chrome-extension://")
++            or origin.startswith("moz-extension://")
++        ):
++            return origin
++        return "http://127.0.0.1:8765"
++
+     def _response(self, start_response: Callable, status: HTTPStatus, payload: Any):
+         body = _json_bytes(payload)
+         start_response(
+@@ -51,7 +74,8 @@ def _response(self, start_response: Callable, status: HTTPStatus, payload: Any):
+             [
+                 ("Content-Type", "application/json; charset=utf-8"),
+                 ("Content-Length", str(len(body))),
+-                ("Access-Control-Allow-Origin", "*"),
++                ("Access-Control-Allow-Origin", self._cors_origin()),
++                ("Vary", "Origin"),
+                 ("Access-Control-Allow-Headers", "Content-Type"),
+                 ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+             ],
+@@ -68,7 +92,9 @@ def _static_response(self, start_response: Callable, filename: str, content_type
+         start_response(
+             "200 OK",
+             [("Content-Type", content_type), ("Content-Length", str(len(body))),
+-             ("Cache-Control", "no-store"), ("Access-Control-Allow-Origin", "*")],
++             ("Cache-Control", "no-store"),
++             ("Access-Control-Allow-Origin", self._cors_origin()),
++             ("Vary", "Origin")],
+         )
+         return [body]
+ 
+@@ -100,7 +126,8 @@ def _frontend_response(self, start_response: Callable, path: str):
+             "200 OK",
+             [("Content-Type", content_type + ("; charset=utf-8" if content_type.startswith(("text/", "application/javascript")) else "")),
+              ("Content-Length", str(len(body))), ("Cache-Control", "no-cache"),
+-             ("Access-Control-Allow-Origin", "*")],
++             ("Access-Control-Allow-Origin", self._cors_origin()),
++             ("Vary", "Origin")],
+         )
+         return [body]
+ 
+@@ -128,7 +155,7 @@ def _product_timezone(self) -> str:
+         """Product timezone for calendar windows; daemon config, else default."""
+         daemon = getattr(self, "daemon", None)
+         config = getattr(daemon, "config", None)
+-        return str(getattr(config, "timezone_name", None) or "Asia/Kolkata")
++        return str(getattr(config, "timezone_name", None) or "UTC")
+ 
+     def _source_today(self) -> Dict[str, Any]:
+         """Use the source query API with AFK intersection for exact live view.
+@@ -407,6 +434,7 @@ def _int_query(query: Dict[str, List[str]], name: str, default: int) -> int:
+ 
+     def __call__(self, environ: Dict[str, Any], start_response: Callable):
+         """Time every request into telemetry, then dispatch unchanged."""
++        _request_local.environ = environ
+         method = environ.get("REQUEST_METHOD", "GET").upper()
+         path = environ.get("PATH_INFO", "/")
+         started = time.perf_counter()
+diff --git a/src/noema/cli/daemon.py b/src/noema/cli/daemon.py
+index f455d44..2de6f71 100644
+--- a/src/noema/cli/daemon.py
++++ b/src/noema/cli/daemon.py
+@@ -206,6 +206,7 @@ def _intervention_engine(config: DaemonConfig) -> InterventionEngine:
+     """Build the intervention policy from config (no code edits needed)."""
+     return InterventionEngine(InterventionPolicy(
+         enabled=True,
++        dry_run=not config.execute_interventions,
+         mode=InterventionMode(config.intervention_mode),
+         cooldown_seconds=config.intervention_cooldown_seconds,
+         require_actionable=config.intervention_require_actionable,
+diff --git a/src/noema/config/settings.py b/src/noema/config/settings.py
+index f475f97..db6d249 100644
+--- a/src/noema/config/settings.py
++++ b/src/noema/config/settings.py
+@@ -177,8 +177,9 @@ class DaemonConfig:
+     session_short_event_seconds: float = 5.0
+     session_merge_gap_seconds: float = 15.0
+     # Product timezone (IANA name) for quota days, daily summaries, and
+-    # calendar windows. Previously hardcoded to Asia/Kolkata everywhere.
+-    timezone_name: str = "Asia/Kolkata"
++    # calendar windows. Defaults to UTC; set NOEMA_TIMEZONE to override
++    # (e.g. "America/New_York", "Europe/London", "Asia/Kolkata").
++    timezone_name: str = "UTC"
+     # Failed attempts per session before it goes terminally failed (visible,
+     # kept, never silently dropped). Retries back off 10/20/40/80/120 min.
+     classification_max_retries: int = 5
+@@ -320,7 +321,7 @@ def __post_init__(self) -> None:
+         self.afk_media_exception = _boolean(self.afk_media_exception)
+         self.session_short_event_seconds = _positive("session_short_event_seconds", self.session_short_event_seconds)
+         self.session_merge_gap_seconds = _positive("session_merge_gap_seconds", self.session_merge_gap_seconds)
+-        self.timezone_name = str(self.timezone_name or "Asia/Kolkata").strip()
++        self.timezone_name = str(self.timezone_name or "UTC").strip()
+         try:
+             ZoneInfo(self.timezone_name)
+         except Exception as exc:
+diff --git a/src/noema/domain/intervention/engine.py b/src/noema/domain/intervention/engine.py
+index 79a080f..a52b814 100644
+--- a/src/noema/domain/intervention/engine.py
++++ b/src/noema/domain/intervention/engine.py
+@@ -388,9 +388,7 @@ def execute(
+     ) -> Intervention:
+         if intervention.status != InterventionStatus.PLANNED:
+             raise ValueError("only planned interventions can be executed")
+-        if not self.policy.dry_run:
+-            if handler is None:
+-                raise ValueError("an intervention handler is required when dry_run is disabled")
++        if not self.policy.dry_run and handler is not None:
+             handler(intervention)
+         executed_at = now or datetime.now(timezone.utc)
+         if executed_at.tzinfo is None:
+diff --git a/src/noema/infrastructure/providers.py b/src/noema/infrastructure/providers.py
+index f0cff6b..1efaa65 100644
+--- a/src/noema/infrastructure/providers.py
++++ b/src/noema/infrastructure/providers.py
+@@ -390,7 +390,10 @@ class QuotaState:
+     rate_limited_count: int = 0
+     last_rate_limited_at: Optional[str] = None
+     minute_window_start: float = field(default_factory=time.monotonic)
+-    day_window_start: float = field(default_factory=time.monotonic)
++    # Day window is a calendar date (UTC ISO string), not a monotonic
++    # elapsed counter. This aligns with QuotaLedger which uses ISO
++    # calendar dates as keys and prevents drift across midnight.
++    day_window_date: str = field(default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+     cooldown_until: float = 0.0
+     consecutive_failures: int = 0
+     last_error: Optional[str] = None
+@@ -402,10 +405,11 @@ def available(self, tokens: int = 0, now: Optional[float] = None) -> bool:
+             self.requests_this_minute = self.tokens_this_minute = 0
+             self.attempts_this_minute = 0
+             self.minute_window_start = current
+-        if current - self.day_window_start >= 86400:
++        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
++        if today != self.day_window_date:
+             self.requests_today = 0
+             self.attempts_today = 0
+-            self.day_window_start = current
++            self.day_window_date = today
+         return (
+             current >= self.cooldown_until
+             and self.attempts_this_minute < self.rpm_limit
+diff --git a/src/noema/api/server.py b/src/noema/api/server.py
+index 7a36031..7ad27f7 100644
+--- a/src/noema/api/server.py
++++ b/src/noema/api/server.py
+@@ -336,7 +336,12 @@ def _classification_status(self) -> Dict[str, Any]:
+         last_provider = getattr(provider, "last_provider", None) or getattr(provider, "name", None)
+         last_model = getattr(provider, "last_model", None) or getattr(provider, "model", None)
+         quota_table = self.service.provider_quotas()
+-        quota = {"model": last_model, "requestsUsed": None, "requestsLimit": None, "requestsRemaining": None}
++        # requestsRemaining is a local ledger estimate — the provider's actual
++        # remaining quota may differ when the API key is shared or used outside
++        # this daemon. isLocalEstimate: true makes this explicit to callers;
++        # quotaScope tells them whether limits are per-model or shared guards.
++        quota = {"model": last_model, "requestsUsed": None, "requestsLimit": None,
++                 "requestsRemaining": None, "isLocalEstimate": True, "quotaScope": None}
+         for row in quota_table.get("models", []):
+             if last_model and row.get("model") != last_model:
+                 continue
+@@ -345,6 +350,8 @@ def _classification_status(self) -> Dict[str, Any]:
+                 "requestsUsed": (row.get("rpd") or {}).get("used"),
+                 "requestsLimit": (row.get("rpd") or {}).get("limit"),
+                 "requestsRemaining": (row.get("rpd") or {}).get("left"),
++                "isLocalEstimate": True,
++                "quotaScope": row.get("quota_scope"),
+             }
+             break
+         worker_error = getattr(worker, "last_error", None)
+@@ -381,7 +388,7 @@ def _classification_status(self) -> Dict[str, Any]:
+ 
+     @staticmethod
+     def _dashboard_window(query: Dict[str, List[str]]) -> tuple[datetime, datetime, str, str]:
+-        timezone_name = query.get("timezone", ["Asia/Kolkata"])[0] or "Asia/Kolkata"
++        timezone_name = query.get("timezone", ["UTC"])[0] or "UTC"
+         try:
+             zone = ZoneInfo(timezone_name)
+         except Exception as exc:
+@@ -580,7 +587,7 @@ def _dispatch(self, environ: Dict[str, Any], start_response: Callable):
+                 requested_application = query.get("application", [None])[0]
+                 if not requested_application:
+                     raise ValueError("application is required")
+-                timezone_name = query.get("timezone", ["Asia/Kolkata"])[0] or "Asia/Kolkata"
++                timezone_name = query.get("timezone", ["UTC"])[0] or "UTC"
+                 zone = ZoneInfo(timezone_name)
+                 selected = datetime.now(zone).replace(hour=0, minute=0, second=0, microsecond=0)
+                 start = coerce_timestamp(query.get("start", [selected.isoformat()])[0])
+diff --git a/src/noema/application/classification.py b/src/noema/application/classification.py
+index 2e00de9..04efd91 100644
+--- a/src/noema/application/classification.py
++++ b/src/noema/application/classification.py
+@@ -540,7 +540,14 @@ def _now_pair() -> tuple:
+ 
+     @staticmethod
+     def _cache_key(session: Any, recent_context: Optional[Iterable[Mapping[str, Any]]] = None) -> str:
++        # session.id is included so that two different sessions with identical
++        # observable fields (same app/title/domain or same project/topic on a
++        # MeaningfulSession) never share a cache entry.  Without this,
++        # MeaningfulSessions that lack app/title/domain all hash identically
++        # when their primary_project/topic are also None, and the first
++        # session's verdict contaminates every subsequent one.
+         evidence = {
++            "session_id": getattr(session, "id", None),
+             "app": getattr(session, "app", None),
+             "title": getattr(session, "title", None),
+             "domain": getattr(session, "domain", None),
+diff --git a/src/noema/application/pipeline.py b/src/noema/application/pipeline.py
+index d7f627d..32ac0b3 100644
+--- a/src/noema/application/pipeline.py
++++ b/src/noema/application/pipeline.py
+@@ -407,7 +407,7 @@ def daily_summary(
+         self,
+         start: datetime,
+         end: datetime,
+-        timezone_name: str = "Asia/Kolkata",
++        timezone_name: str = "UTC",
+     ) -> dict:
+         """Aggregate one calendar window without counting overlapping events twice."""
+ 
+@@ -438,11 +438,6 @@ def daily_summary(
+         if window_events:
+             events = window_events
+         sessions = self.store.query_sessions(start=effective_start, end=end, limit=100000)
+-        classifications = {
+-            item.session_id: item
+-            for item in self.store.query_classifications(limit=100000)
+-            if item.classification_status == "classified" and item.source != "heuristic"
+-        }
+         # The live pipeline classifies meaningful sessions, so a raw session
+         # without its own row inherits its parent meaningful verdict. Direct
+         # rows always win. Without this the summary would show unclassified
+@@ -453,6 +448,12 @@ def daily_summary(
+         ):
+             for raw_id in meaningful.activity_session_ids:
+                 meaningful_parents.setdefault(raw_id, meaningful.id)
++        all_ids = [s.id for s in sessions] + list(meaningful_parents.values())
++        classifications = {
++            session_id: item
++            for session_id, item in self.store.query_classification_map(all_ids).items()
++            if item.classification_status == "classified" and item.source != "heuristic"
++        }
+         for session in sessions:
+             if session.id not in classifications and session.id in meaningful_parents:
+                 parent = classifications.get(meaningful_parents[session.id])
+@@ -681,8 +682,10 @@ def events_with_classifications(self, events: Iterable[Any]) -> list:
+ 
+         sessions = self.store.query_sessions(limit=10000)
+         classifications = {
+-            item.session_id: item
+-            for item in self.store.query_classifications(limit=10000)
++            session_id: item
++            for session_id, item in self.store.query_classification_map(
++                [s.id for s in sessions]
++            ).items()
+             if item.classification_status == "classified" and item.source != "heuristic"
+         }
+         event_session_ids = {
+@@ -774,17 +777,21 @@ def recent_activity(self, start: Any, end: Any, limit: int = 100) -> list:
+         """Return logical ActivitySessions, not one row per watcher heartbeat."""
+ 
+         sessions = self.store.query_sessions(start=start, end=end, limit=100000)
+-        classifications = {
+-            item.session_id: item
+-            for item in self.store.query_classifications(limit=100000)
+-            if item.classification_status == "classified" and item.source != "heuristic"
+-        }
+         # The live pipeline classifies meaningful sessions, so a raw session
+         # without its own row inherits its parent meaningful verdict.
+         parent_of = {}
+         for meaningful in self.store.query_meaningful_sessions(start=start, end=end, limit=100000):
+             for raw_id in meaningful.activity_session_ids:
+                 parent_of.setdefault(raw_id, meaningful.id)
++        # Fetch only the IDs we actually need: raw sessions + their meaningful
++        # parents. This prevents a global scan from missing classifications
++        # whose insertion timestamp is older than the global-limit cutoff.
++        all_ids = [s.id for s in sessions] + list(parent_of.values())
++        classifications = {
++            session_id: item
++            for session_id, item in self.store.query_classification_map(all_ids).items()
++            if item.classification_status == "classified" and item.source != "heuristic"
++        }
+         rows = []
+         for session in sessions:
+             classification = classifications.get(session.id)
+@@ -911,7 +918,7 @@ def provider_quotas(self) -> dict:
+                 ledger_snapshot = {}
+             ledger_usage = ledger_snapshot
+         day = datetime.now(timezone.utc).date().isoformat()
+-        day_timezone = "Asia/Kolkata"
++        day_timezone = "UTC"
+         latency_ms = {}
+         latencies = getattr(provider, "model_latency_ms", None)
+         if isinstance(latencies, dict):
+@@ -1746,13 +1753,10 @@ def _record(window: Any, decision: Any, tracker_state: str,
+                 start=lookback_start, end=current, limit=100000)
+         except (AttributeError, OSError, TypeError, ValueError):
+             sessions = []
+-        session_ids = {getattr(item, "id", None) for item in sessions}
+         try:
+-            class_map = {
+-                item.session_id: item
+-                for item in self.store.query_classifications(limit=100000)
+-                if item.session_id in session_ids
+-            }
++            class_map = self.store.query_classification_map(
++                [item.id for item in sessions if getattr(item, "id", None)]
++            )
+         except (AttributeError, OSError, TypeError, ValueError):
+             class_map = {}
+         current_goal = None
+@@ -1968,10 +1972,9 @@ def recent_classifications(self, limit: int = 12) -> list:
+             )
+         }
+         classifications = {
+-            item.session_id: item
+-            for item in self.store.query_classifications(limit=100000)
+-            if item.session_id in session_ids
+-            and item.classification_status == "classified"
++            session_id: item
++            for session_id, item in self.store.query_classification_map(list(session_ids)).items()
++            if item.classification_status == "classified"
+             and item.source != "heuristic"
+         }
+         rows = []
+@@ -2260,11 +2263,10 @@ def evaluate_stored_behavior(
+             meaningful = [item for item in meaningful if device in item.device_set]
+         if meaningful:
+             session_ids = {session.id for session in meaningful}
+-            classifications = {
+-                item.session_id: item
+-                for item in self.store.query_classifications(limit=limit)
+-                if item.session_id in session_ids
+-            }
++            # Use a targeted query instead of fetching all classifications and
++            # filtering in Python; on long-running databases the global scan
++            # can miss classifications outside the most-recent `limit` rows.
++            classifications = self.store.query_classification_map(session_ids)
+             alignments = {
+                 item.session_id: item
+                 for item in self.store.query_alignments(intent_id=intent_id, limit=limit)
+@@ -2274,11 +2276,7 @@ def evaluate_stored_behavior(
+ 
+         sessions = self.store.query_sessions(start, end, device, limit=limit)
+         session_ids = {session.id for session in sessions}
+-        classifications = {
+-            item.session_id: item
+-            for item in self.store.query_classifications(limit=limit)
+-            if item.session_id in session_ids
+-        }
++        classifications = self.store.query_classification_map(session_ids)
+         alignments = {
+             item.session_id: item
+             for item in self.store.query_alignments(intent_id=intent_id, limit=limit)
+@@ -2571,7 +2569,7 @@ def build_meaningful_sessions(
+         summarize: bool = False,
+     ) -> list:
+         raw = self.store.query_sessions(start=start, end=end, limit=limit)
+-        classifications = {item.session_id: item for item in self.store.query_classifications(limit=limit)}
++        classifications = self.store.query_classification_map([s.id for s in raw])
+         alignments = {
+             item.session_id: item
+             for item in self.store.query_alignments(intent_id=intent_id, limit=limit)
+@@ -2647,7 +2645,7 @@ def measure_outcome(
+         sessions = self.store.query_meaningful_sessions(start=intervention.created_at, limit=100000)
+         if not sessions:
+             sessions = self.store.query_sessions(start=intervention.created_at, limit=100000)
+-        classifications = {item.session_id: item for item in self.store.query_classifications(limit=100000)}
++        classifications = self.store.query_classification_map([s.id for s in sessions])
+         outcome = self.outcome_tracker.measure(intervention, sessions, classifications, now, meme_id)
+         with self._observe_db("outcome_write") as state:
+             self.store.insert_outcome(outcome)
+@@ -2670,7 +2668,7 @@ def derive_memories(self, limit: int = 100000) -> list:
+         sessions = self.store.query_meaningful_sessions(limit=limit)
+         if not sessions:
+             sessions = self.store.query_sessions(limit=limit)
+-        classifications = {item.session_id: item for item in self.store.query_classifications(limit=limit)}
++        classifications = self.store.query_classification_map([s.id for s in sessions])
+         observations = {item.session_id: item for item in self.store.query_behavior_observations(limit=limit)}
+         memories = self.memory_engine.derive_distraction_patterns(sessions, classifications, observations)
+         for memory in memories:
+diff --git a/src/noema/infrastructure/providers.py b/src/noema/infrastructure/providers.py
+index 1efaa65..437c023 100644
+--- a/src/noema/infrastructure/providers.py
++++ b/src/noema/infrastructure/providers.py
+@@ -245,15 +245,15 @@ class QuotaLedger:
+ 
+     Tracks ``(kind, model)`` pairs — ``kind`` is ``"llm"`` or
+     ``"embedding"`` — counting requests and tokens against the current
+-    quota day in ``day_timezone`` (default Asia/Kolkata, matching the
+-    product timezone, so counters refresh at the user's 12am). State is
++    quota day in ``day_timezone`` (default UTC; set NOEMA_TIMEZONE to match
++    the user's local midnight so counters refresh at the right time). State is
+     kept in a JSON file (atomically replaced on write) so a daemon restart
+     cannot lose the daily counters and accidentally cross RPD. With
+     ``path=None`` the ledger is memory-only (tests, throwaway processes).
+     All methods are thread-safe.
+     """
+ 
+-    def __init__(self, path: Optional[Any] = None, day_timezone: str = "Asia/Kolkata"):
++    def __init__(self, path: Optional[Any] = None, day_timezone: str = "UTC"):
+         self.path = str(Path(path).expanduser()) if path is not None else None
+         try:
+             self._zone = ZoneInfo(day_timezone) if ZoneInfo is not None else timezone.utc
+@@ -1159,7 +1159,7 @@ class ProviderChain:
+ 
+     def __init__(self, hosted: Optional[list] = None, ollama: Optional[OllamaProvider] = None,
+                  usage_path: Optional[Any] = None, include_ollama: bool = False,
+-                 day_timezone: str = "Asia/Kolkata", openrouter: Optional[list] = None,
++                 day_timezone: str = "UTC", openrouter: Optional[list] = None,
+                  observer: Optional[Any] = None):
+         self.providers = list(openrouter or []) + list(
+             hosted or [GeminiProvider(model=model) for model in self.HOSTED_MODELS])
+diff --git a/src/noema/runtime/daemon.py b/src/noema/runtime/daemon.py
+index 68e7b0a..4c120b5 100644
+--- a/src/noema/runtime/daemon.py
++++ b/src/noema/runtime/daemon.py
+@@ -441,7 +441,10 @@ def health_dict(self) -> Dict[str, Any]:
+                 "last_ingest_at": _iso(last_ingest_at),
+                 "last_activity_event": _iso(last_activity_event),
+                 "tracked_data_freshness": freshness,
+-                "ollama_connected": payload.get("provider_health") in {"available", "healthy"},
++                # "configured" is the health value for non-Ollama providers
++                # (hosted_chain, Gemini). Include it so ollama_connected
++                # correctly signals "AI is available" for all provider types.
++                "ollama_connected": payload.get("provider_health") in {"available", "healthy", "configured"},
+                 "last_ollama_analysis": _iso(last_ollama_analysis),
+                 "next_ollama_analysis": _iso(next_ollama_analysis),
+                 "ollama_analysis_in_progress": self._ollama_analysis_in_progress,
+@@ -615,11 +618,19 @@ def run_once(self, now: Optional[Any] = None, include_daily_report: bool = False
+ 
+         current = coerce_timestamp(now) if now is not None else _utc_now()
+         with self._pipeline_lock:
++            ingest = self._ingest_stage(current)
++            # Serialize the semantic stage with the background semantic worker so
++            # concurrent runs never double-call the model for the same sessions or
++            # overwrite a "classified" status with a later "failed" from a race.
++            with self._semantic_lock:
++                semantics = self._semantics_stage(current)
++            behavior = self._behavior_stage(current)
++            outcomes = self._outcome_stage(current)
+             result = {
+-                "ingest": self._ingest_stage(current),
+-                "semantics": self._semantics_stage(current),
+-                "behavior": self._behavior_stage(current),
+-                "outcomes": self._outcome_stage(current),
++                "ingest": ingest,
++                "semantics": semantics,
++                "behavior": behavior,
++                "outcomes": outcomes,
+             }
+             if include_daily_report:
+                 result["daily_report"] = self._daily_report_stage(current)

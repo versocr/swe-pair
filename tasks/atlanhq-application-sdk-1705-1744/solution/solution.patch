@@ -1,0 +1,459 @@
+diff --git a/application_sdk/constants.py b/application_sdk/constants.py
+index 3beb94e8de..692334c8b6 100644
+--- a/application_sdk/constants.py
++++ b/application_sdk/constants.py
+@@ -136,9 +136,9 @@
+ # Temporal Prometheus Metrics
+ #: Bind address for the Temporal Runtime's Rust-core Prometheus endpoint.
+ #: Defaults to loopback (127.0.0.1) so the endpoint is not externally
+-#: reachable — the FastAPI ``/metrics`` endpoint proxies it on the server,
+-#: and the worker's ``TemporalCoreCollector`` scrapes it locally to feed the
+-#: Pushgateway push.
++#: reachable — combined-mode FastAPI ``/metrics`` proxies it in-process,
++#: and the worker's ``TemporalCoreCollector`` scrapes it locally to feed
++#: the Pushgateway push.
+ TEMPORAL_PROMETHEUS_BIND_ADDRESS = os.getenv(
+     "ATLAN_TEMPORAL_PROMETHEUS_BIND_ADDRESS", "127.0.0.1:9464"
+ )
+diff --git a/application_sdk/handler/service.py b/application_sdk/handler/service.py
+index b3b34ff975..3a2f9f7d4c 100644
+--- a/application_sdk/handler/service.py
++++ b/application_sdk/handler/service.py
+@@ -72,12 +72,17 @@
+ logger = get_logger(__name__)
+ 
+ 
+-def _record_proxy_failure(reason: str, log_message: str) -> None:
++def _record_proxy_failure(
++    reason: str,
++    log_message: str,
++    *log_args: object,
++    exc_info: bool = False,
++) -> None:
+     """Record a Temporal-core ``/metrics`` proxy failure.
+ 
+     Increments the ``temporal_core_metrics_proxy_failures_total`` counter
+     so failures are observable from VictoriaMetrics (and not just buried
+-    in the WARNING logs), and emits the warning. ``reason`` should be a
++    in the logs), and emits a bounded diagnostic. ``reason`` should be a
+     bounded label value — exception class name or ``http_<status>``."""
+     from application_sdk.observability import (  # noqa: PLC0415 — cold path: only on proxy failure
+         metrics as _metrics_module,
+@@ -93,7 +98,7 @@ def _record_proxy_failure(reason: str, log_message: str) -> None:
+         unit="1",
+     )
+     counter.add(1, {"reason": reason})
+-    logger.warning(log_message, exc_info=True)
++    logger.warning(log_message, *log_args, exc_info=exc_info)
+ 
+ 
+ def _serialize_credential_value(v: Any) -> str:
+@@ -274,6 +279,10 @@ class WorkflowClientConfig:
+     auth_base_url: str = ""
+     auth_scopes: str = ""
+ 
++    # Temporal Rust-core metrics
++    enable_temporal_core_metrics: bool = True
++    prometheus_bind_address: str = ""
++
+     def is_configured(self) -> bool:
+         return bool(self.host and self.app_class)
+ 
+@@ -364,6 +373,8 @@ async def _get_temporal_client() -> Client:
+         tls_client_cert_path=_workflow_config.tls_client_cert_path,
+         tls_client_private_key_path=_workflow_config.tls_client_private_key_path,
+         tls_domain=_workflow_config.tls_domain,
++        enable_prometheus=_workflow_config.enable_temporal_core_metrics,
++        prometheus_bind_address=_workflow_config.prometheus_bind_address,
+     )
+     logger.info("Connected to Temporal")
+ 
+@@ -408,6 +419,8 @@ def create_app_handler_service(
+     description: str = "Per-app handler service for authentication, preflight, and metadata operations",
+     version: str = "1.0.0",
+     frontend_assets_path: str = "app/generated/frontend/static",
++    enable_temporal_core_metrics: bool = True,
++    prometheus_bind_address: str = "",
+     # Deprecated: state_store is no longer used. Credential resolution now
+     # goes through DaprCredentialVault exclusively. Passing this parameter
+     # emits a DeprecationWarning. Will be removed in v3.2.0.
+@@ -431,6 +444,10 @@ def create_app_handler_service(
+         frontend_assets_path: Path to the directory containing frontend static assets.
+             Serves ``index.html`` at ``GET /`` and mounts remaining assets as static
+             files. Defaults to ``"app/generated/frontend/static"``.
++        enable_temporal_core_metrics: When true, ``GET /metrics`` proxies
++            Temporal Rust-core metrics from ``prometheus_bind_address``.
++        prometheus_bind_address: Loopback bind address for the Temporal
++            Rust-core metrics endpoint. Defaults to the SDK constant.
+ 
+     Returns:
+         Configured FastAPI application.
+@@ -465,6 +482,8 @@ def create_app_handler_service(
+         auth_token_url=auth_token_url,
+         auth_base_url=auth_base_url,
+         auth_scopes=auth_scopes,
++        enable_temporal_core_metrics=enable_temporal_core_metrics,
++        prometheus_bind_address=prometheus_bind_address,
+     )
+ 
+     from application_sdk.constants import (  # noqa: PLC0415 — cold path: only at handler service startup
+@@ -1716,9 +1735,9 @@ async def prometheus_metrics() -> Response:
+            from FastAPIInstrumentor, the worker's ``MetricsInterceptor``, and
+            any custom user metrics via ``application_sdk.observability.metrics``.
+         2. The Temporal Runtime's loopback Prometheus endpoint — proxies the
+-           Rust-core metrics (gRPC client-call latencies on the server,
+-           workflow / activity task latencies, sticky cache, etc.) so
+-           operators have a single scrape target per pod.
++           Rust-core metrics when enabled and reachable (gRPC client-call
++           latencies on the server, workflow / activity task latencies,
++           sticky cache, etc.) so combined pods have a single scrape target.
+         """
+         from prometheus_client import (  # noqa: PLC0415 — cold path: prometheus only when /metrics is hit
+             REGISTRY,
+@@ -1730,31 +1749,42 @@ async def prometheus_metrics() -> Response:
+             TEMPORAL_PROMETHEUS_BIND_ADDRESS,
+         )
+ 
+-        body = generate_latest(REGISTRY)
++        temporal_metrics_body: bytes | None = None
+ 
+-        if TEMPORAL_PROMETHEUS_BIND_ADDRESS:
+-            try:
+-                import httpx  # noqa: PLC0415 — cold path: only when Temporal Rust-core proxy enabled
++        temporal_bind_address = (
++            prometheus_bind_address or TEMPORAL_PROMETHEUS_BIND_ADDRESS
++        )
++        if enable_temporal_core_metrics and temporal_bind_address:
++            temporal_metrics_url = f"http://{temporal_bind_address}/metrics"
++            import httpx  # noqa: PLC0415 — cold path: only when Temporal Rust-core proxy enabled
+ 
++            try:
+                 async with httpx.AsyncClient(
+                     timeout=TEMPORAL_CORE_METRICS_PROXY_TIMEOUT_SECONDS
+                 ) as client:
+-                    resp = await client.get(
+-                        f"http://{TEMPORAL_PROMETHEUS_BIND_ADDRESS}/metrics"
+-                    )
++                    resp = await client.get(temporal_metrics_url)
+                     if resp.status_code == 200:
+-                        body = body + b"\n" + resp.content
++                        temporal_metrics_body = resp.content
+                     else:
+                         _record_proxy_failure(
+                             f"http_{resp.status_code}",
+-                            f"Temporal core metrics proxy returned HTTP {resp.status_code}",
++                            "Temporal core metrics proxy returned HTTP %s from %s; serving /metrics without Temporal core series",
++                            resp.status_code,
++                            temporal_metrics_url,
+                         )
+-            except Exception as exc:
++            except httpx.RequestError as exc:
++                # Handler-only mode disables this proxy; enabled proxy failures are unexpected.
+                 _record_proxy_failure(
+                     type(exc).__name__,
+-                    "Temporal core metrics unavailable",
++                    "Temporal core metrics proxy request failed for %s; serving /metrics without Temporal core series",
++                    temporal_metrics_url,
++                    exc_info=True,
+                 )
+ 
++        body = generate_latest(REGISTRY)
++        if temporal_metrics_body:
++            body = body + b"\n" + temporal_metrics_body
++
+         return Response(
+             content=body,
+             media_type="text/plain; version=0.0.4; charset=utf-8",
+diff --git a/application_sdk/main.py b/application_sdk/main.py
+index 4651c003a9..b5e3d5b65f 100644
+--- a/application_sdk/main.py
++++ b/application_sdk/main.py
+@@ -157,15 +157,15 @@ class AppConfig:
+     enable_temporal_core_metrics: bool = True
+     """Enable Temporal Runtime's loopback Prometheus endpoint that exposes
+     the Rust-core metric set (``temporal_workflow_*``, ``temporal_activity_*``
+-    etc.). Default ``True`` so the FastAPI ``/metrics`` proxy can pull these
+-    metrics, and so worker-mode's ``TemporalCoreCollector`` can read them
+-    locally to feed the Pushgateway push. Set to ``False`` in
++    etc.). Default ``True`` so combined-mode FastAPI ``/metrics`` can proxy
++    these metrics, and so worker-mode's ``TemporalCoreCollector`` can read
++    them locally to feed the Pushgateway push. Set to ``False`` in
+     ``run_dev_combined()`` to avoid port collisions on hot reload."""
+ 
+     prometheus_bind_address: str = "127.0.0.1:9464"
+     """Loopback bind address for the Temporal Runtime Prometheus endpoint.
+-    Not externally reachable — only the FastAPI ``/metrics`` proxy and the
+-    worker's ``TemporalCoreCollector`` consume it."""
++    Not externally reachable — only the combined-mode FastAPI ``/metrics``
++    proxy and the worker's ``TemporalCoreCollector`` consume it."""
+ 
+     enable_mcp: bool = False
+     """Enable Model Context Protocol (MCP) server.
+@@ -953,6 +953,8 @@ def run_handler_mode(config: AppConfig) -> None:
+         auth_token_url=config.auth_token_url,
+         auth_base_url=config.auth_base_url,
+         auth_scopes=config.auth_scopes,
++        enable_temporal_core_metrics=False,
++        prometheus_bind_address=config.prometheus_bind_address,
+         secret_store=infra.secret_store,
+         storage=infra.storage,
+         frontend_assets_path=config.frontend_assets_path,
+@@ -1115,6 +1117,8 @@ async def run_combined_mode(config: AppConfig) -> None:
+         auth_token_url=config.auth_token_url,
+         auth_base_url=config.auth_base_url,
+         auth_scopes=config.auth_scopes,
++        enable_temporal_core_metrics=config.enable_temporal_core_metrics,
++        prometheus_bind_address=config.prometheus_bind_address,
+         secret_store=infra.secret_store,
+         storage=infra.storage,
+         frontend_assets_path=config.frontend_assets_path,
+diff --git a/docs/concepts/clients.md b/docs/concepts/clients.md
+index a6a71139d8..f83b0f6caa 100644
+--- a/docs/concepts/clients.md
++++ b/docs/concepts/clients.md
+@@ -220,12 +220,12 @@ Pass the resulting `ssl.SSLContext` via `DB_CONFIG.connect_args={"ssl": ssl_ctx}
+ 
+ ## Prometheus Metrics
+ 
+-Every deployed application exposes its full metrics surface — SDK
+-custom metrics, HTTP server instrumentation, Temporal SDK Rust-core
+-families, and `prometheus_client` defaults — through a single FastAPI
+-`/metrics` endpoint on `containerPort` (default 8000). The Temporal
+-Rust-core endpoint at `127.0.0.1:9464` is loopback-only and proxied
+-in-process; operators don't scrape it directly.
++Every deployed application exposes its FastAPI metrics surface — SDK
++custom metrics, HTTP server instrumentation, and `prometheus_client`
++defaults — through a single FastAPI `/metrics` endpoint on
++`containerPort` (default 8000). Combined pods also proxy Temporal SDK
++Rust-core families from the loopback-only `127.0.0.1:9464` endpoint;
++operators don't scrape that port directly.
+ `ATLAN_ENABLE_TEMPORAL_CORE_METRICS` (default `true`) gates only that
+ loopback binding, not the FastAPI route. See
+ [`docs/concepts/monitoring.md`](monitoring.md) for the full
+diff --git a/docs/concepts/common.md b/docs/concepts/common.md
+index 4ae1377951..3d03002261 100644
+--- a/docs/concepts/common.md
++++ b/docs/concepts/common.md
+@@ -229,4 +229,4 @@ include_pattern, exclude_pattern = prepare_filters(
+ 
+ | Constant | Env Var | Default | Description |
+ |----------|---------|---------|-------------|
+-| `TEMPORAL_PROMETHEUS_BIND_ADDRESS` | `ATLAN_TEMPORAL_PROMETHEUS_BIND_ADDRESS` | `127.0.0.1:9464` | Bind address for Temporal SDK Prometheus metrics. Loopback-only — not externally reachable. FastAPI `/metrics` proxies it in-process. |
++| `TEMPORAL_PROMETHEUS_BIND_ADDRESS` | `ATLAN_TEMPORAL_PROMETHEUS_BIND_ADDRESS` | `127.0.0.1:9464` | Bind address for Temporal SDK Prometheus metrics. Loopback-only — not externally reachable. Combined-mode FastAPI `/metrics` proxies it in-process. |
+diff --git a/docs/concepts/monitoring.md b/docs/concepts/monitoring.md
+index 5680c99670..bd425b5c81 100644
+--- a/docs/concepts/monitoring.md
++++ b/docs/concepts/monitoring.md
+@@ -14,15 +14,18 @@ one of two transports, depending on pod role:
+ 
+ | Pod role | Transport | Endpoint |
+ |---|---|---|
+-| **Combined / handler** | Direct scrape | `http://<pod>:8000/metrics` (FastAPI) |
++| **Combined** | Direct scrape | `http://<pod>:8000/metrics` (FastAPI, including proxied Temporal Rust-core metrics when enabled) |
++| **Handler** | Direct scrape | `http://<pod>:8000/metrics` (FastAPI in-process metrics; Temporal Rust-core proxy disabled by default) |
+ | **Worker** (split deployment) | Push | Pushgateway at `ATLAN_PROMETHEUS_PUSHGATEWAY_URL` |
+ 
+ The Temporal SDK's Rust-core Prometheus endpoint (`127.0.0.1:9464`) is
+ bound **loopback only** and is not externally reachable. The FastAPI
+-`/metrics` handler proxies it in-process for combined / handler pods;
+-the worker's `TemporalCoreCollector` reads it locally and includes the
+-families in each Pushgateway push. So scrape configurations always
+-target the FastAPI port (or the Pushgateway), never `:9464` directly.
++`/metrics` handler proxies it in-process for combined pods; handler-only
++pods skip that proxy by default because no local worker/runtime is started
++with the handler process. The worker's `TemporalCoreCollector` reads it
++locally and includes the families in each Pushgateway push. So scrape
++configurations always target the FastAPI port (or the Pushgateway), never
++`:9464` directly.
+ 
+ ### What's in the metric body
+ 
+@@ -48,22 +51,22 @@ The FastAPI `/metrics` endpoint (or a worker push) merges:
+   Stable conventions are enabled via `OTEL_SEMCONV_STABILITY_OPT_IN=http`
+   — set in the chart by default for v3+ apps.
+ - **Temporal SDK** families from `MetricsInterceptor` (counters and
+-  histograms emitted by activity/workflow execution) plus the Rust-core
+-  families proxied from `127.0.0.1:9464` (`temporal_request_*`,
+-  `temporal_workflow_task_*`, `temporal_sticky_cache_*`,
+-  `temporal_num_pollers`, etc.)
++  histograms emitted by activity/workflow execution) plus, when enabled
++  and reachable, the Rust-core families proxied from `127.0.0.1:9464`
++  (`temporal_request_*`, `temporal_workflow_task_*`,
++  `temporal_sticky_cache_*`, `temporal_num_pollers`, etc.)
+ - **`prometheus_client` defaults** (`process_*`, `python_gc_*`,
+   `python_info`)
+ 
+ ### `ATLAN_ENABLE_TEMPORAL_CORE_METRICS`
+ 
+ This env var **does not gate the FastAPI `/metrics` route** — that
+-endpoint is always registered. The flag controls only whether the
+-Temporal Rust-core endpoint binds `127.0.0.1:9464`:
++endpoint is always registered. The flag controls whether worker/combined
++mode creates a Temporal Runtime that binds `127.0.0.1:9464`:
+ 
+ | Value | Effect |
+ |---|---|
+-| `true` (default) | Rust core binds 9464; FastAPI proxy + worker `TemporalCoreCollector` can read it |
++| `true` (default) | Rust core binds 9464 in worker/combined mode; combined FastAPI proxy + worker `TemporalCoreCollector` can read it |
+ | `false` | Rust core uses `Runtime.default()` (no Prometheus listener); FastAPI `/metrics` still serves SDK + HTTP + python defaults but lacks the `temporal_*` Rust-core families |
+ 
+ `run_dev_combined()` proactively sets it to `false` in local dev so a
+diff --git a/docs/concepts/server.md b/docs/concepts/server.md
+index ed12d07848..121799921f 100644
+--- a/docs/concepts/server.md
++++ b/docs/concepts/server.md
+@@ -68,7 +68,7 @@ All routes registered by `create_app_handler_service()`:
+ | `/events/v1/drop` | POST | Return a Dapr `DROP` status, instructing the sidecar to drop the received event without retry or dead-lettering |
+ | `/health`, `/server/health` | GET | Liveness probe |
+ | `/ready`, `/server/ready` | GET | Readiness probe |
+-| `/metrics` | GET | Prometheus metrics (always exposed; merges SDK custom metrics + HTTP server instrumentation + Temporal Rust-core families proxied from `127.0.0.1:9464` + `prometheus_client` defaults) |
++| `/metrics` | GET | Prometheus metrics (always exposed; merges SDK custom metrics + HTTP server instrumentation + `prometheus_client` defaults, plus Temporal Rust-core families proxied from `127.0.0.1:9464` when enabled and reachable) |
+ | `/` | GET | API root / service info |
+ 
+ ## MCP Server Integration
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 5161ba0a07..37a6b14bbb 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -43,7 +43,7 @@ Injected by the Local Marketplace into the Helm release at deploy time, and expo
+ | `ATLAN_TEMPORAL_HOST` | `localhost:7233` | Temporal server address (`host:port`). **v2-compat fallback:** if unset, the SDK constructs the address from `ATLAN_WORKFLOW_HOST` + `ATLAN_WORKFLOW_PORT` (deprecated; remove when all deployments set `ATLAN_TEMPORAL_HOST`). |
+ | `ATLAN_TEMPORAL_NAMESPACE` | `default` | Temporal namespace. **v2-compat fallback:** `ATLAN_WORKFLOW_NAMESPACE`. |
+ | `ATLAN_TASK_QUEUE` | _(derived)_ | Temporal task queue name. Defaults to `atlan-{ATLAN_APPLICATION_NAME}-{ATLAN_DEPLOYMENT_NAME}` when both are set, or just the app name when only `ATLAN_APPLICATION_NAME` is set, or `{ClassName}-queue` (kebab-case) when neither is set. |
+-| `ATLAN_TEMPORAL_PROMETHEUS_BIND_ADDRESS` | `127.0.0.1:9464` | Bind address for the Temporal SDK Prometheus endpoint (~40 built-in metrics). Loopback-only by default — operators should not scrape this port directly; the FastAPI `/metrics` handler proxies it in-process. See [Monitoring](concepts/monitoring.md). |
++| `ATLAN_TEMPORAL_PROMETHEUS_BIND_ADDRESS` | `127.0.0.1:9464` | Bind address for the Temporal SDK Prometheus endpoint (~40 built-in metrics). Loopback-only by default — operators should not scrape this port directly; combined-mode FastAPI `/metrics` proxies it in-process. See [Monitoring](concepts/monitoring.md). |
+ 
+ ### Worker Versioning
+ 
+@@ -175,7 +175,7 @@ Used by `RedisCapacityPool` for distributed slot locking. Leave empty if you use
+ | `ATLAN_METRICS_FLUSH_INTERVAL_SECONDS` | `10` | Seconds between parquet sink flushes. |
+ | `ATLAN_METRICS_RETENTION_DAYS` | `30` | Days to retain parquet metric files. |
+ | `ATLAN_METRICS_CLEANUP_ENABLED` | `false` | Enable automatic cleanup of old metric files. Uses `.lower() == "true"` — safe to set to `"false"` to disable. |
+-| `ATLAN_ENABLE_TEMPORAL_CORE_METRICS` | `true` | Bind the Temporal Rust-core Prometheus endpoint at `ATLAN_TEMPORAL_PROMETHEUS_BIND_ADDRESS` (loopback) so its metric set (`temporal_workflow_*`, `temporal_activity_*`, etc.) is reachable for the FastAPI `/metrics` proxy and the worker's `TemporalCoreCollector`. The FastAPI `/metrics` route is always exposed regardless of this flag — when this flag is `false`, the response simply omits the proxied Temporal Rust-core families. `run_dev_combined()` defaults to `false` to avoid hot-reload port collisions. See [Monitoring](concepts/monitoring.md). |
++| `ATLAN_ENABLE_TEMPORAL_CORE_METRICS` | `true` | Bind the Temporal Rust-core Prometheus endpoint at `ATLAN_TEMPORAL_PROMETHEUS_BIND_ADDRESS` (loopback) in worker/combined mode so its metric set (`temporal_workflow_*`, `temporal_activity_*`, etc.) is reachable for the combined-mode FastAPI `/metrics` proxy and the worker's `TemporalCoreCollector`. The FastAPI `/metrics` route is always exposed regardless of this flag — when this flag is `false`, or in handler-only mode, the response simply omits the proxied Temporal Rust-core families. `run_dev_combined()` defaults to `false` to avoid hot-reload port collisions. See [Monitoring](concepts/monitoring.md). |
+ | `ATLAN_PROMETHEUS_PUSHGATEWAY_URL` | _(empty)_ | Pushgateway URL workers push to (split deployment). Empty disables push — combined-mode pods leave it unset and rely on direct `/metrics` scrape. |
+ | `ATLAN_PROMETHEUS_PUSHGATEWAY_INTERVAL_SECONDS` | `30` | Periodic push interval. A final push always happens on shutdown. |
+ | `ATLAN_PROMETHEUS_PUSHGATEWAY_DELETE_ON_SHUTDOWN` | `true` | DELETE the worker's group from the gateway on graceful shutdown so stopped pods don't leave sticky data. |
+@@ -183,7 +183,7 @@ Used by `RedisCapacityPool` for distributed slot locking. Leave empty if you use
+ | `ATLAN_PROMETHEUS_PUSHGATEWAY_SWEEP_STALENESS_SECONDS` | `300` | Don't reap groups whose last push is more recent than this. Protects live siblings during rolling deploys. |
+ | `ATLAN_PROMETHEUS_PUSHGATEWAY_HTTP_TIMEOUT_SECONDS` | `10` | Per-request HTTP timeout for every Pushgateway call. |
+ | `ATLAN_PROMETHEUS_PUSHGATEWAY_SHUTDOWN_DELETE_DELAY_SECONDS` | `35` | Sleep between final push and DELETE on shutdown so Prometheus has at least one scrape window to read the final batch. |
+-| `ATLAN_TEMPORAL_CORE_METRICS_PROXY_TIMEOUT_SECONDS` | `5.0` | Per-request HTTP timeout (seconds) for the in-process FastAPI `/metrics` proxy fetching Temporal Rust-core series from `ATLAN_TEMPORAL_PROMETHEUS_BIND_ADDRESS`. Increase if the loopback fetch times out under heavy load. |
++| `ATLAN_TEMPORAL_CORE_METRICS_PROXY_TIMEOUT_SECONDS` | `5.0` | Per-request HTTP timeout (seconds) for the in-process FastAPI `/metrics` proxy fetching Temporal Rust-core series from `ATLAN_TEMPORAL_PROMETHEUS_BIND_ADDRESS` when the proxy is enabled. Increase if the loopback fetch times out under heavy load. |
+ 
+ ---
+ 
+@@ -272,7 +272,7 @@ ATLAN_AUTH_TOKEN_URL=https://auth.internal/oauth2/token
+ ATLAN_AUTH_CLIENT_ID=…                        # or use deployment secret store
+ ATLAN_AUTH_CLIENT_SECRET=…
+ ENABLE_ATLAN_UPLOAD=true
+-ATLAN_ENABLE_TEMPORAL_CORE_METRICS=true       # default; binds Temporal Rust-core on 127.0.0.1:9464 (loopback) for FastAPI /metrics to proxy
++ATLAN_ENABLE_TEMPORAL_CORE_METRICS=true       # default; binds Temporal Rust-core on 127.0.0.1:9464 (loopback) for combined /metrics proxy and worker pushes
+ # /metrics is always exposed on the FastAPI handler port (default 8000) — no env-var gate
+ # For worker-only pods (split deployment), set the Pushgateway URL instead:
+ # ATLAN_PROMETHEUS_PUSHGATEWAY_URL=http://prometheus-pushgateway.monitoring.svc.cluster.local:9091
+diff --git a/docs/guides/deployment.md b/docs/guides/deployment.md
+index 47a464655a..f650dd29ee 100644
+--- a/docs/guides/deployment.md
++++ b/docs/guides/deployment.md
+@@ -119,7 +119,7 @@ ATLAN_AUTH_TOKEN_URL=https://auth.internal/oauth2/token
+ # Observability
+ OTEL_EXPORTER_OTLP_ENDPOINT=http://$(K8S_NODE_IP):4317
+ ATLAN_ENABLE_TEMPORAL_CORE_METRICS=true                    # default; binds Temporal Rust core on loopback
+-# ATLAN_TEMPORAL_PROMETHEUS_BIND_ADDRESS=127.0.0.1:9464    # default; loopback-only, FastAPI /metrics proxies it
++# ATLAN_TEMPORAL_PROMETHEUS_BIND_ADDRESS=127.0.0.1:9464    # default; loopback-only, combined /metrics proxies it
+ # Worker-only pods (split deployment) push to a Pushgateway:
+ # ATLAN_PROMETHEUS_PUSHGATEWAY_URL=http://prometheus-pushgateway.monitoring.svc.cluster.local:9091
+ 
+diff --git a/docs/reference/http-api.md b/docs/reference/http-api.md
+index 68b55aef8d..3d4390eeff 100644
+--- a/docs/reference/http-api.md
++++ b/docs/reference/http-api.md
+@@ -323,8 +323,8 @@ response merges all in-process metric sources:
+ - Custom metrics from `record_metric()` and direct OTel meter use
+ - HTTP server instrumentation (FastAPIInstrumentor, stable OTel HTTP
+   semantic conventions: `http.request.method`, `http.route`, etc.)
+-- Temporal SDK Rust-core families (proxied in-process from
+-  `127.0.0.1:9464`)
++- Temporal SDK Rust-core families when enabled and reachable (proxied
++  in-process from `127.0.0.1:9464` in combined mode)
+ - `prometheus_client` defaults (`process_*`, `python_*`)
+ 
+ See [Monitoring](../concepts/monitoring.md) for the full architecture
+diff --git a/docs/standards/metrics.md b/docs/standards/metrics.md
+index 86507c7177..0d76ef9927 100644
+--- a/docs/standards/metrics.md
++++ b/docs/standards/metrics.md
+@@ -231,7 +231,7 @@ Names emitted by the consolidated SDK surface (all use OTel base units
+ | `http_server_response_body_size_bytes` | histogram | same |
+ | `http_server_active_requests` | gauge | same |
+ | `temporal_*` (Rust-core families) | various | Temporal SDK Rust core, scraped via FastAPI proxy or pushed via `TemporalCoreCollector` |
+-| `temporal_core_metrics_proxy_failures_total` | counter | `handler/service.py` — bumped (with `reason` label) when the in-process Temporal-core proxy fetch from `127.0.0.1:9464` fails (timeout, non-200, etc.) so `up=1` scrapes with missing `temporal_*` series are observable from VictoriaMetrics rather than only from WARNING logs |
++| `temporal_core_metrics_proxy_failures_total` | counter | `handler/service.py` — bumped (with `reason` label) when the in-process Temporal-core proxy fetch from `127.0.0.1:9464` fails (timeout, non-200, etc.) so `up=1` scrapes with missing `temporal_*` series are observable from VictoriaMetrics rather than only from logs |
+ 
+ ## User-facing Metrics Shim
+ 
+diff --git a/application_sdk/handler/service.py b/application_sdk/handler/service.py
+index 3a2f9f7d4c..9103a1289b 100644
+--- a/application_sdk/handler/service.py
++++ b/application_sdk/handler/service.py
+@@ -63,7 +63,6 @@
+     HandlerCredential,
+     MetadataInput,
+     PreflightInput,
+-    PreflightStatus,
+     SubscriptionConfig,
+ )
+ from application_sdk.handler.manifest import AppManifest
+@@ -633,21 +632,49 @@ async def preflight_check(request: Request) -> JSONResponse:
+                 )
+                 # Build v2-compatible response: each check becomes a top-level
+                 # key in data so the frontend can iterate check names directly.
+-                # v2 format: {"authenticationCheck": {"success": true, "message": "..."}, ...}
++                # v2 format: {"authenticationCheck": {"success": true,
++                # "successMessage": "...", "failureMessage": "..."}, ...}.
++                #
++                # The SageV2 widget at
++                # atlan-frontend/src/workflowsv2/components/dynamicForm2/widget/SageV2.vue:271-273
++                # renders ``checkResult.success ? successMessage :
++                # failureMessage`` with no fallback to ``message``, so omitting
++                # those fields leaves the detail panel blank on a failed check
++                # (DBBI-665, WARE-1250). ``message`` is retained so any
++                # consumer already reading the v3 field keeps working.
++                #
++                # This finishes the third sub-mismatch from BLDX-901; PR #1228
++                # converted ``checks`` → camelCase keys and ``passed`` →
++                # ``success`` but left the message-field rename.
+                 v2_data: dict[str, Any] = {}
+                 for check in result.checks:
+                     # Convert check name to camelCase key (e.g. "AuthCheck" -> "authCheck")
+                     key = check.name[0].lower() + check.name[1:]
++                    msg = check.message or ""
+                     v2_data[key] = {
+                         "success": check.passed,
+-                        "message": check.message or "",
++                        "message": msg,
++                        "successMessage": msg if check.passed else "",
++                        "failureMessage": "" if check.passed else msg,
+                     }
++                # Envelope ``success`` reports whether preflight executed at
++                # all, not whether every check passed — per-check pass/fail
++                # belongs in ``data.<check>.success``. The SageV2 widget at
++                # SageV2.vue:249 short-circuits on ``!response.success`` and
++                # skips the per-check render loop entirely, so collapsing
++                # envelope success to ``status == READY`` (the previous
++                # behaviour) made every PARTIAL/NOT_READY response surface
++                # as "Check failed" with a blank "Hide details" panel
++                # (DBBI-665). Tying envelope success to "any check ran"
++                # keeps it false when the handler produced no checks (a
++                # genuine preflight-system failure) and lets the widget
++                # render per-check rows otherwise.
+                 return JSONResponse(
+                     content=_wrap_response(
+                         v2_data,
+                         message=result.message
+                         or f"Preflight check {result.status.value}",
+-                        success=result.status == PreflightStatus.READY,
++                        success=len(result.checks) > 0,
+                     )
+                 )
+             except HandlerError as e:

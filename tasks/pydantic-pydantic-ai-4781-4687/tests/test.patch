@@ -1,0 +1,793 @@
+diff --git a/tests/models/test_model_test.py b/tests/models/test_model_test.py
+index 94a8740d..80c4c184 100644
+--- a/tests/models/test_model_test.py
++++ b/tests/models/test_model_test.py
+@@ -4,7 +4,6 @@ from __future__ import annotations as _annotations
+ 
+ import asyncio
+ import dataclasses
+-import re
+ from datetime import timezone
+ from typing import Annotated, Any, Literal
+ 
+@@ -288,7 +287,7 @@ def test_output_tool_retry_error_handled():
+         call_count += 1
+         raise ModelRetry('Fail')
+ 
+-    with pytest.raises(UnexpectedModelBehavior, match=re.escape('Exceeded maximum retries (2) for output validation')):
++    with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum retries \(2\) for output validation'):
+         agent.run_sync('Hello', model=TestModel())
+ 
+     assert call_count == 3
+diff --git a/tests/test_agent.py b/tests/test_agent.py
+index c209c9ad..75db9e6c 100644
+--- a/tests/test_agent.py
++++ b/tests/test_agent.py
+@@ -455,6 +455,381 @@ def test_tool_output_function_retries():
+     assert max_retries_log == [target_retries] * (target_retries + 1)
+ 
+ 
++def test_tool_output_max_retries_overrides_agent_retries():
++    """ToolOutput.max_retries takes priority over Agent retries. Regression test for #4678."""
++    retries_log: list[int] = []
++    max_retries_log: list[int] = []
++    target_retries = 5
++
++    def get_weather(ctx: RunContext[None], city: str) -> str:
++        retries_log.append(ctx.retry)
++        max_retries_log.append(ctx.max_retries)
++        if ctx.retry < target_retries:
++            raise ModelRetry(f'Retry {ctx.retry}')
++        return f'Weather in {city}'
++
++    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
++        assert info.output_tools is not None
++        args_json = '{"city": "Mexico City"}'
++        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
++
++    # Agent retries=2 (lower than ToolOutput), ToolOutput max_retries=5
++    # The ToolOutput value should take priority, allowing 5 retries
++    agent = Agent(
++        FunctionModel(return_model),
++        output_type=ToolOutput(get_weather, max_retries=target_retries),
++        retries=2,
++    )
++
++    result = agent.run_sync('Hello')
++    assert result.output == 'Weather in Mexico City'
++    assert retries_log == [0, 1, 2, 3, 4, 5]
++    assert max_retries_log == [target_retries] * (target_retries + 1)
++    assert result.all_messages() == snapshot(
++        [
++            ModelRequest(
++                parts=[UserPromptPart(content='Hello', timestamp=IsDatetime())],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelResponse(
++                parts=[
++                    ToolCallPart(
++                        tool_name='final_result',
++                        args='{"city": "Mexico City"}',
++                        tool_call_id=IsStr(),
++                    )
++                ],
++                usage=RequestUsage(input_tokens=51, output_tokens=6),
++                model_name='function:return_model:',
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelRequest(
++                parts=[
++                    RetryPromptPart(
++                        content='Retry 0',
++                        tool_name='final_result',
++                        tool_call_id=IsStr(),
++                        timestamp=IsDatetime(),
++                    )
++                ],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelResponse(
++                parts=[
++                    ToolCallPart(
++                        tool_name='final_result',
++                        args='{"city": "Mexico City"}',
++                        tool_call_id=IsStr(),
++                    )
++                ],
++                usage=RequestUsage(input_tokens=60, output_tokens=12),
++                model_name='function:return_model:',
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelRequest(
++                parts=[
++                    RetryPromptPart(
++                        content='Retry 1',
++                        tool_name='final_result',
++                        tool_call_id=IsStr(),
++                        timestamp=IsDatetime(),
++                    )
++                ],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelResponse(
++                parts=[
++                    ToolCallPart(
++                        tool_name='final_result',
++                        args='{"city": "Mexico City"}',
++                        tool_call_id=IsStr(),
++                    )
++                ],
++                usage=RequestUsage(input_tokens=69, output_tokens=18),
++                model_name='function:return_model:',
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelRequest(
++                parts=[
++                    RetryPromptPart(
++                        content='Retry 2',
++                        tool_name='final_result',
++                        tool_call_id=IsStr(),
++                        timestamp=IsDatetime(),
++                    )
++                ],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelResponse(
++                parts=[
++                    ToolCallPart(
++                        tool_name='final_result',
++                        args='{"city": "Mexico City"}',
++                        tool_call_id=IsStr(),
++                    )
++                ],
++                usage=RequestUsage(input_tokens=78, output_tokens=24),
++                model_name='function:return_model:',
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelRequest(
++                parts=[
++                    RetryPromptPart(
++                        content='Retry 3',
++                        tool_name='final_result',
++                        tool_call_id=IsStr(),
++                        timestamp=IsDatetime(),
++                    )
++                ],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelResponse(
++                parts=[
++                    ToolCallPart(
++                        tool_name='final_result',
++                        args='{"city": "Mexico City"}',
++                        tool_call_id=IsStr(),
++                    )
++                ],
++                usage=RequestUsage(input_tokens=87, output_tokens=30),
++                model_name='function:return_model:',
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelRequest(
++                parts=[
++                    RetryPromptPart(
++                        content='Retry 4',
++                        tool_name='final_result',
++                        tool_call_id=IsStr(),
++                        timestamp=IsDatetime(),
++                    )
++                ],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelResponse(
++                parts=[
++                    ToolCallPart(
++                        tool_name='final_result',
++                        args='{"city": "Mexico City"}',
++                        tool_call_id=IsStr(),
++                    )
++                ],
++                usage=RequestUsage(input_tokens=96, output_tokens=36),
++                model_name='function:return_model:',
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelRequest(
++                parts=[
++                    ToolReturnPart(
++                        tool_name='final_result',
++                        content='Final result processed.',
++                        tool_call_id=IsStr(),
++                        timestamp=IsDatetime(),
++                    )
++                ],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++        ]
++    )
++
++
++def test_tool_output_max_retries_per_tool():
++    """Multiple ToolOutputs with different max_retries are tracked independently. Regression test for #4678."""
++    a_max_retries_seen: list[int] = []
++    b_max_retries_seen: list[int] = []
++
++    def output_a(ctx: RunContext[None], value: str) -> str:
++        a_max_retries_seen.append(ctx.max_retries)
++        if ctx.retry < 3:
++            raise ModelRetry(f'Retry A {ctx.retry}')
++        return f'A: {value}'
++
++    def output_b(ctx: RunContext[None], value: str) -> str:
++        b_max_retries_seen.append(ctx.max_retries)
++        raise ModelRetry(f'Retry B {ctx.retry}')
++
++    tool_names: dict[str, str] = {}
++    call_count = 0
++
++    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
++        nonlocal call_count
++        call_count += 1
++        assert info.output_tools is not None
++        tool_names.update({t.name: t.name for t in info.output_tools})
++
++        name_a = next(n for n in tool_names if 'output_a' in n)
++        name_b = next(n for n in tool_names if 'output_b' in n)
++
++        # First call output_b to verify it sees max_retries=1, then switch to output_a
++        if call_count == 1:
++            return ModelResponse(parts=[ToolCallPart(name_b, '{"value": "x"}')])
++        return ModelResponse(parts=[ToolCallPart(name_a, '{"value": "hello"}')])
++
++    # output_a gets 3 retries, output_b gets 1 — agent default is 0
++    agent = Agent(
++        FunctionModel(return_model),
++        output_type=[
++            ToolOutput(output_a, max_retries=3),
++            ToolOutput(output_b, max_retries=1),
++        ],
++        retries=0,
++    )
++
++    result = agent.run_sync('Hello')
++    assert result.output == 'A: hello'
++    # output_b was called once and saw its own max_retries=1
++    assert b_max_retries_seen == [1]
++    # output_a was called 4 times (retries 0-3) and saw its own max_retries=3
++    assert a_max_retries_seen == [3, 3, 3, 3]
++    assert result.all_messages() == snapshot(
++        [
++            ModelRequest(
++                parts=[UserPromptPart(content='Hello', timestamp=IsDatetime())],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelResponse(
++                parts=[
++                    ToolCallPart(
++                        tool_name='final_result_output_b',
++                        args='{"value": "x"}',
++                        tool_call_id=IsStr(),
++                    )
++                ],
++                usage=RequestUsage(input_tokens=51, output_tokens=5),
++                model_name='function:return_model:',
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelRequest(
++                parts=[
++                    RetryPromptPart(
++                        content='Retry B 0',
++                        tool_name='final_result_output_b',
++                        tool_call_id=IsStr(),
++                        timestamp=IsDatetime(),
++                    )
++                ],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelResponse(
++                parts=[
++                    ToolCallPart(
++                        tool_name='final_result_output_a',
++                        args='{"value": "hello"}',
++                        tool_call_id=IsStr(),
++                    )
++                ],
++                usage=RequestUsage(input_tokens=61, output_tokens=10),
++                model_name='function:return_model:',
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelRequest(
++                parts=[
++                    RetryPromptPart(
++                        content='Retry A 0',
++                        tool_name='final_result_output_a',
++                        tool_call_id=IsStr(),
++                        timestamp=IsDatetime(),
++                    )
++                ],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelResponse(
++                parts=[
++                    ToolCallPart(
++                        tool_name='final_result_output_a',
++                        args='{"value": "hello"}',
++                        tool_call_id=IsStr(),
++                    )
++                ],
++                usage=RequestUsage(input_tokens=71, output_tokens=15),
++                model_name='function:return_model:',
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelRequest(
++                parts=[
++                    RetryPromptPart(
++                        content='Retry A 1',
++                        tool_name='final_result_output_a',
++                        tool_call_id=IsStr(),
++                        timestamp=IsDatetime(),
++                    )
++                ],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelResponse(
++                parts=[
++                    ToolCallPart(
++                        tool_name='final_result_output_a',
++                        args='{"value": "hello"}',
++                        tool_call_id=IsStr(),
++                    )
++                ],
++                usage=RequestUsage(input_tokens=81, output_tokens=20),
++                model_name='function:return_model:',
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelRequest(
++                parts=[
++                    RetryPromptPart(
++                        content='Retry A 2',
++                        tool_name='final_result_output_a',
++                        tool_call_id=IsStr(),
++                        timestamp=IsDatetime(),
++                    )
++                ],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelResponse(
++                parts=[
++                    ToolCallPart(
++                        tool_name='final_result_output_a',
++                        args='{"value": "hello"}',
++                        tool_call_id=IsStr(),
++                    )
++                ],
++                usage=RequestUsage(input_tokens=91, output_tokens=25),
++                model_name='function:return_model:',
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++            ModelRequest(
++                parts=[
++                    ToolReturnPart(
++                        tool_name='final_result_output_a',
++                        content='Final result processed.',
++                        tool_call_id=IsStr(),
++                        timestamp=IsDatetime(),
++                    )
++                ],
++                timestamp=IsDatetime(),
++                run_id=IsStr(),
++            ),
++        ]
++    )
++
++
+ class TestPartialOutput:
+     """Tests for `ctx.partial_output` flag in output validators and output functions."""
+ 
+@@ -4446,9 +4821,86 @@ class TestMultipleToolCalls:
+             end_strategy='exhaustive',
+         )
+ 
+-        with pytest.raises(UnexpectedModelBehavior, match='Exceeded maximum retries \\(1\\) for output validation'):
++        with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum retries \(1\) for output validation'):
+             agent.run_sync('test')
+ 
++    def test_exhaustive_skips_output_tool_exceeding_retries_on_validation(self):
++        """Exhaustive strategy skips an output tool that exceeds its per-tool retry limit during validation,
++        when another output tool already produced a valid result."""
++
++        def process_first(output: OutputType) -> OutputType:
++            return output
++
++        def process_second(output: OutputType) -> OutputType:  # pragma: no cover
++            assert False
++
++        call_count = 0
++
++        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
++            nonlocal call_count
++            call_count += 1
++            assert info.output_tools is not None
++            return ModelResponse(
++                parts=[
++                    # First tool gets valid args, second gets invalid args
++                    ToolCallPart('first_output', {'value': 'valid'}),
++                    ToolCallPart('second_output', {'invalid': 'bad'}),
++                ],
++            )
++
++        agent = Agent(
++            FunctionModel(return_model),
++            output_type=[
++                ToolOutput(process_first, name='first_output'),
++                ToolOutput(process_second, name='second_output', max_retries=0),
++            ],
++            end_strategy='exhaustive',
++        )
++
++        # First tool succeeds, second fails validation and exceeds max_retries=0
++        # The run should succeed with the first tool's result
++        result = agent.run_sync('test')
++        assert isinstance(result.output, OutputType)
++        assert result.output.value == 'valid'
++
++    def test_exhaustive_skips_output_tool_exceeding_retries_on_execution(self):
++        """Exhaustive strategy skips an output tool that exceeds its per-tool retry limit during execution,
++        when another output tool already produced a valid result."""
++
++        def process_first(output: OutputType) -> OutputType:
++            return output
++
++        def process_second(ctx: RunContext[None], value: str) -> str:
++            raise ModelRetry('always fails')
++
++        call_count = 0
++
++        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
++            nonlocal call_count
++            call_count += 1
++            assert info.output_tools is not None
++            return ModelResponse(
++                parts=[
++                    ToolCallPart('first_output', {'value': 'valid'}),
++                    ToolCallPart('second_output', '{"value": "hello"}'),
++                ],
++            )
++
++        agent = Agent(
++            FunctionModel(return_model),
++            output_type=[
++                ToolOutput(process_first, name='first_output'),
++                ToolOutput(process_second, name='second_output', max_retries=0),
++            ],
++            end_strategy='exhaustive',
++        )
++
++        # First tool succeeds, second passes validation but fails execution and exceeds max_retries=0
++        # The run should succeed with the first tool's result
++        result = agent.run_sync('test')
++        assert isinstance(result.output, OutputType)
++        assert result.output.value == 'valid'
++
+     def test_multiple_final_result_are_validated_correctly(self):
+         """Tests that if multiple final results are returned, but one fails validation, the other is used."""
+ 
+diff --git a/tests/test_capabilities.py b/tests/test_capabilities.py
+index e2d2dce0..a981fb55 100644
+--- a/tests/test_capabilities.py
++++ b/tests/test_capabilities.py
+@@ -30,6 +30,7 @@ from pydantic_ai.messages import (
+     TextPart,
+     ToolCallPart,
+     ToolReturnPart,
++    UserPromptPart,
+ )
+ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
+ from pydantic_ai.models.test import TestModel
+@@ -38,9 +39,10 @@ from pydantic_ai.settings import ModelSettings as _ModelSettings
+ from pydantic_ai.tools import ToolDefinition
+ from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
+ from pydantic_ai.toolsets._dynamic import ToolsetFunc
+-from pydantic_ai.usage import RunUsage
++from pydantic_ai.usage import RequestUsage, RunUsage
+ 
+ from ._inline_snapshot import snapshot
++from .conftest import IsDatetime, IsStr
+ 
+ pytestmark = [
+     pytest.mark.anyio,
+@@ -2448,3 +2450,273 @@ class TestPrepareToolsCapability:
+         from pydantic_ai.capabilities import PrepareTools
+ 
+         assert PrepareTools.get_serialization_name() is None
++
++
++class TestGetWrapperToolsetHook:
++    async def test_wrapper_prefixes_tools(self):
++        """Capability can wrap the toolset to prefix tool names."""
++        from pydantic_ai.toolsets.prefixed import PrefixedToolset
++
++        @dataclass
++        class PrefixCap(AbstractCapability[Any]):
++            def get_wrapper_toolset(self, toolset: AbstractToolset[Any]) -> AbstractToolset[Any] | None:
++                return PrefixedToolset(toolset, prefix='cap')
++
++        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
++            tool_names = sorted(t.name for t in info.function_tools)
++            return make_text_response(f'tools: {tool_names}')
++
++        agent = Agent(FunctionModel(model_fn), capabilities=[PrefixCap()])
++
++        @agent.tool_plain
++        def my_tool() -> str:
++            return 'result'
++
++        result = await agent.run('hello')
++        assert result.output == "tools: ['cap_my_tool']"
++        assert result.all_messages() == snapshot(
++            [
++                ModelRequest(
++                    parts=[UserPromptPart(content='hello', timestamp=IsDatetime())],
++                    timestamp=IsDatetime(),
++                    run_id=IsStr(),
++                ),
++                ModelResponse(
++                    parts=[TextPart(content="tools: ['cap_my_tool']")],
++                    usage=RequestUsage(input_tokens=51, output_tokens=2),
++                    model_name='function:model_fn:',
++                    timestamp=IsDatetime(),
++                    run_id=IsStr(),
++                ),
++            ]
++        )
++
++    async def test_wrapper_prefixes_tools_streaming(self):
++        """Wrapper toolset works correctly with streaming runs."""
++        from pydantic_ai.toolsets.prefixed import PrefixedToolset
++
++        @dataclass
++        class PrefixCap(AbstractCapability[Any]):
++            def get_wrapper_toolset(self, toolset: AbstractToolset[Any]) -> AbstractToolset[Any] | None:
++                return PrefixedToolset(toolset, prefix='cap')
++
++        async def stream_fn(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
++            tool_names = sorted(t.name for t in info.function_tools)
++            yield f'tools: {tool_names}'
++
++        agent = Agent(FunctionModel(stream_function=stream_fn), capabilities=[PrefixCap()])
++
++        @agent.tool_plain
++        def my_tool() -> str:
++            return 'result'
++
++        async with agent.run_stream('hello') as result:
++            output = await result.get_output()
++        assert output == "tools: ['cap_my_tool']"
++
++    async def test_wrapper_does_not_affect_output_tools(self):
++        """Wrapper toolset does not wrap output tools."""
++        from pydantic_ai.toolsets.wrapper import WrapperToolset
++
++        seen_tool_names: list[list[str]] = []
++
++        @dataclass
++        class SpyWrapperToolset(WrapperToolset[Any]):
++            async def get_tools(self, ctx: RunContext[Any]) -> dict[str, Any]:
++                tools = await super().get_tools(ctx)
++                seen_tool_names.append(sorted(tools.keys()))
++                return tools
++
++        @dataclass
++        class SpyWrapperCap(AbstractCapability[Any]):
++            def get_wrapper_toolset(self, toolset: AbstractToolset[Any]) -> AbstractToolset[Any] | None:
++                return SpyWrapperToolset(toolset)
++
++        agent = Agent(
++            TestModel(),
++            output_type=int,
++            capabilities=[SpyWrapperCap()],
++        )
++
++        @agent.tool_plain
++        def add_one(x: int) -> int:
++            """Add one to x."""
++            return x + 1
++
++        await agent.run('hello')
++        # The wrapper should only see function tools, not output tools
++        for tool_names in seen_tool_names:
++            assert 'add_one' in tool_names
++            # Output tool names should not appear in the wrapped toolset
++            assert all(not name.startswith('final_result') for name in tool_names)
++
++    async def test_wrapper_none_is_noop(self):
++        """Returning None from get_wrapper_toolset leaves the toolset unchanged."""
++
++        @dataclass
++        class NoopCap(AbstractCapability[Any]):
++            def get_wrapper_toolset(self, toolset: AbstractToolset[Any]) -> AbstractToolset[Any] | None:
++                return None
++
++        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
++            tool_names = sorted(t.name for t in info.function_tools)
++            return make_text_response(f'tools: {tool_names}')
++
++        agent = Agent(FunctionModel(model_fn), capabilities=[NoopCap()])
++
++        @agent.tool_plain
++        def my_tool() -> str:
++            return 'result'
++
++        result = await agent.run('hello')
++        assert result.output == "tools: ['my_tool']"
++        assert result.all_messages() == snapshot(
++            [
++                ModelRequest(
++                    parts=[UserPromptPart(content='hello', timestamp=IsDatetime())],
++                    timestamp=IsDatetime(),
++                    run_id=IsStr(),
++                ),
++                ModelResponse(
++                    parts=[TextPart(content="tools: ['my_tool']")],
++                    usage=RequestUsage(input_tokens=51, output_tokens=2),
++                    model_name='function:model_fn:',
++                    timestamp=IsDatetime(),
++                    run_id=IsStr(),
++                ),
++            ]
++        )
++
++    async def test_wrapper_chaining_order(self):
++        """Multiple capabilities' wrappers compose by nesting: first wraps innermost."""
++        from pydantic_ai.toolsets.prefixed import PrefixedToolset
++
++        @dataclass
++        class PrefixCap(AbstractCapability[Any]):
++            prefix: str
++
++            def get_wrapper_toolset(self, toolset: AbstractToolset[Any]) -> AbstractToolset[Any] | None:
++                return PrefixedToolset(toolset, prefix=self.prefix)
++
++        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
++            tool_names = sorted(t.name for t in info.function_tools)
++            return make_text_response(f'tools: {tool_names}')
++
++        agent = Agent(
++            FunctionModel(model_fn),
++            capabilities=[PrefixCap(prefix='a'), PrefixCap(prefix='b')],
++        )
++
++        @agent.tool_plain
++        def tool() -> str:
++            return 'r'
++
++        result = await agent.run('hello')
++        # First cap wraps innermost (a_tool), then second wraps that (b_a_tool)
++        assert result.output == "tools: ['b_a_tool']"
++        assert result.all_messages() == snapshot(
++            [
++                ModelRequest(
++                    parts=[UserPromptPart(content='hello', timestamp=IsDatetime())],
++                    timestamp=IsDatetime(),
++                    run_id=IsStr(),
++                ),
++                ModelResponse(
++                    parts=[TextPart(content="tools: ['b_a_tool']")],
++                    usage=RequestUsage(input_tokens=51, output_tokens=2),
++                    model_name='function:model_fn:',
++                    timestamp=IsDatetime(),
++                    run_id=IsStr(),
++                ),
++            ]
++        )
++
++    async def test_wrapper_with_per_run_capability(self):
++        """Wrapper works correctly with capabilities returning new instances from for_run."""
++        from pydantic_ai.toolsets.prefixed import PrefixedToolset
++
++        @dataclass
++        class PerRunPrefixCap(AbstractCapability[Any]):
++            prefix: str = 'default'
++
++            async def for_run(self, ctx: RunContext[Any]) -> AbstractCapability[Any]:
++                return PerRunPrefixCap(prefix='runtime')
++
++            def get_wrapper_toolset(self, toolset: AbstractToolset[Any]) -> AbstractToolset[Any] | None:
++                return PrefixedToolset(toolset, prefix=self.prefix)
++
++        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
++            tool_names = sorted(t.name for t in info.function_tools)
++            return make_text_response(f'tools: {tool_names}')
++
++        agent = Agent(FunctionModel(model_fn), capabilities=[PerRunPrefixCap()])
++
++        @agent.tool_plain
++        def my_tool() -> str:
++            return 'result'
++
++        result = await agent.run('hello')
++        # The per-run instance should use 'runtime' prefix, not 'default'
++        assert result.output == "tools: ['runtime_my_tool']"
++        assert result.all_messages() == snapshot(
++            [
++                ModelRequest(
++                    parts=[UserPromptPart(content='hello', timestamp=IsDatetime())],
++                    timestamp=IsDatetime(),
++                    run_id=IsStr(),
++                ),
++                ModelResponse(
++                    parts=[TextPart(content="tools: ['runtime_my_tool']")],
++                    usage=RequestUsage(input_tokens=51, output_tokens=2),
++                    model_name='function:model_fn:',
++                    timestamp=IsDatetime(),
++                    run_id=IsStr(),
++                ),
++            ]
++        )
++
++    async def test_wrapper_with_agent_prepare_tools(self):
++        """Agent-level prepare_tools is applied before capability wrapper."""
++        from dataclasses import replace as dc_replace
++
++        from pydantic_ai.toolsets.prefixed import PrefixedToolset
++
++        @dataclass
++        class PrefixCap(AbstractCapability[Any]):
++            def get_wrapper_toolset(self, toolset: AbstractToolset[Any]) -> AbstractToolset[Any] | None:
++                return PrefixedToolset(toolset, prefix='cap')
++
++        async def agent_prepare(ctx: RunContext[Any], tool_defs: list[ToolDefinition]) -> list[ToolDefinition]:
++            return [dc_replace(td, description=f'[prepared] {td.description}') for td in tool_defs]
++
++        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
++            tool_names = sorted(t.name for t in info.function_tools)
++            descs = [t.description for t in info.function_tools]
++            return make_text_response(f'tools: {tool_names}, descs: {descs}')
++
++        agent = Agent(FunctionModel(model_fn), prepare_tools=agent_prepare, capabilities=[PrefixCap()])
++
++        @agent.tool_plain
++        def my_tool() -> str:
++            """Original."""
++            return 'result'
++
++        result = await agent.run('hello')
++        # Both agent prepare_tools (description) and capability wrapper (prefix) should apply
++        assert result.output == "tools: ['cap_my_tool'], descs: ['[prepared] Original.']"
++        assert result.all_messages() == snapshot(
++            [
++                ModelRequest(
++                    parts=[UserPromptPart(content='hello', timestamp=IsDatetime())],
++                    timestamp=IsDatetime(),
++                    run_id=IsStr(),
++                ),
++                ModelResponse(
++                    parts=[TextPart(content="tools: ['cap_my_tool'], descs: ['[prepared] Original.']")],
++                    usage=RequestUsage(input_tokens=51, output_tokens=6),
++                    model_name='function:model_fn:',
++                    timestamp=IsDatetime(),
++                    run_id=IsStr(),
++                ),
++            ]
++        )

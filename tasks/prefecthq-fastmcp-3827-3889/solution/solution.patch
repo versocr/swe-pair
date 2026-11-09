@@ -1,0 +1,522 @@
+diff --git a/docs/servers/telemetry.mdx b/docs/servers/telemetry.mdx
+index 1055dc0..bf755ce 100644
+--- a/docs/servers/telemetry.mdx
++++ b/docs/servers/telemetry.mdx
+@@ -61,14 +61,14 @@ The server creates spans for each operation using [MCP semantic conventions](htt
+ | Span Name | Description |
+ |-----------|-------------|
+ | `tools/call {name}` | Tool execution (e.g., `tools/call get_weather`) |
+-| `resources/read {uri}` | Resource read (e.g., `resources/read config://database`) |
++| `resources/read` | Resource read (URI in `mcp.resource.uri` attribute, not span name) |
+ | `prompts/get {name}` | Prompt render (e.g., `prompts/get greeting`) |
+ 
+ For mounted servers, an additional `delegate {name}` span shows the delegation to the child server.
+ 
+ ### Client Spans
+ 
+-The FastMCP client creates spans for outgoing requests with the same naming pattern (`tools/call {name}`, `resources/read {uri}`, `prompts/get {name}`).
++The FastMCP client creates spans for outgoing requests with the same naming pattern (`tools/call {name}`, `resources/read`, `prompts/get {name}`).
+ 
+ ### Span Hierarchy
+ 
+@@ -186,21 +186,16 @@ def risky_operation() -> str:
+     raise ValueError("Something went wrong")
+ 
+ # The span will have:
+-# - status = ERROR
++# - status = ERROR with exception message as description
++# - error.type = "tool_error" (or exception class name for non-tool errors)
+ # - exception event with stack trace
+ ```
+ 
+ ## Attributes Reference
+ 
+-### RPC Semantic Conventions
+-
+-Standard [RPC semantic conventions](https://opentelemetry.io/docs/specs/semconv/rpc/rpc-spans/):
+-
+-| Attribute | Value |
+-|-----------|-------|
+-| `rpc.system` | `"mcp"` |
+-| `rpc.service` | Server name |
+-| `rpc.method` | MCP protocol method |
++<Warning>
++**Migrating from v3.1 or earlier:** The `rpc.system`, `rpc.service`, and `rpc.method` span attributes were removed in favor of the [MCP semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/) listed below. If you have dashboards or alerts keyed on those `rpc.*` attributes, update them to use `mcp.method.name` and the `fastmcp.*` attributes instead.
++</Warning>
+ 
+ ### MCP Semantic Conventions
+ 
+@@ -211,6 +206,9 @@ FastMCP implements the [OpenTelemetry MCP semantic conventions](https://opentele
+ | `mcp.method.name` | The MCP method being called (`tools/call`, `resources/read`, `prompts/get`) |
+ | `mcp.session.id` | Session identifier for the MCP connection |
+ | `mcp.resource.uri` | The resource URI (for resource operations) |
++| `gen_ai.tool.name` | Tool name (on `tools/call` spans) |
++| `gen_ai.prompt.name` | Prompt name (on `prompts/get` spans) |
++| `error.type` | Error classification (`tool_error` for ToolError, otherwise exception class name) |
+ 
+ ### Auth Attributes
+ 
+diff --git a/src/fastmcp/client/mixins/prompts.py b/src/fastmcp/client/mixins/prompts.py
+index 4b87bf2..bb32cc2 100644
+--- a/src/fastmcp/client/mixins/prompts.py
++++ b/src/fastmcp/client/mixins/prompts.py
+@@ -130,6 +130,7 @@ class ClientPromptsMixin:
+             "prompts/get",
+             name,
+             session_id=self.transport.get_session_id(),
++            prompt_name=name,
+         ):
+             logger.debug(f"[{self.name}] called get_prompt: {name}")
+ 
+diff --git a/src/fastmcp/client/mixins/resources.py b/src/fastmcp/client/mixins/resources.py
+index c0dc27f..c97fbe9 100644
+--- a/src/fastmcp/client/mixins/resources.py
++++ b/src/fastmcp/client/mixins/resources.py
+@@ -193,7 +193,7 @@ class ClientResourcesMixin:
+         """
+         uri_str = str(uri)
+         with client_span(
+-            f"resources/read {uri_str}",
++            "resources/read",
+             "resources/read",
+             uri_str,
+             session_id=self.transport.get_session_id(),
+diff --git a/src/fastmcp/client/mixins/tools.py b/src/fastmcp/client/mixins/tools.py
+index aec5950..00a4a42 100644
+--- a/src/fastmcp/client/mixins/tools.py
++++ b/src/fastmcp/client/mixins/tools.py
+@@ -7,6 +7,7 @@ import weakref
+ from typing import TYPE_CHECKING, Any, Literal, overload
+ 
+ import mcp.types
++from opentelemetry.trace import Status, StatusCode
+ from pydantic import RootModel
+ 
+ if TYPE_CHECKING:
+@@ -144,7 +145,8 @@ class ClientToolsMixin:
+             "tools/call",
+             name,
+             session_id=self.transport.get_session_id(),
+-        ):
++            tool_name=name,
++        ) as span:
+             logger.debug(f"[{self.name}] called call_tool: {name}")
+ 
+             # Inject trace context into meta for propagation to server
+@@ -159,6 +161,18 @@ class ClientToolsMixin:
+                     meta=propagated_meta if propagated_meta else None,
+                 )
+             )
++
++            # Reflect tool-level errors on the span so callers see ERROR
++            # status even though the MCP protocol call itself succeeded.
++            if result.isError and span.is_recording():
++                span.set_attribute("error.type", "tool_error")
++                description = ""
++                if result.content and isinstance(
++                    result.content[0], mcp.types.TextContent
++                ):
++                    description = result.content[0].text
++                span.set_status(Status(StatusCode.ERROR, description))
++
+             return result
+ 
+     async def _parse_call_tool_result(
+diff --git a/src/fastmcp/client/telemetry.py b/src/fastmcp/client/telemetry.py
+index 10d6d82..e66cd7b 100644
+--- a/src/fastmcp/client/telemetry.py
++++ b/src/fastmcp/client/telemetry.py
+@@ -5,6 +5,7 @@ from contextlib import contextmanager
+ 
+ from opentelemetry.trace import Span, SpanKind, Status, StatusCode
+ 
++from fastmcp.exceptions import ToolError as _ToolError
+ from fastmcp.telemetry import get_tracer
+ 
+ 
+@@ -15,6 +16,8 @@ def client_span(
+     component_key: str,
+     session_id: str | None = None,
+     resource_uri: str | None = None,
++    tool_name: str | None = None,
++    prompt_name: str | None = None,
+ ) -> Generator[Span, None, None]:
+     """Create a CLIENT span with standard MCP attributes.
+ 
+@@ -22,25 +25,32 @@ def client_span(
+     """
+     tracer = get_tracer()
+     with tracer.start_as_current_span(name, kind=SpanKind.CLIENT) as span:
+-        attrs: dict[str, str] = {
+-            # RPC semantic conventions
+-            "rpc.system": "mcp",
+-            "rpc.method": method,
+-            # MCP semantic conventions
+-            "mcp.method.name": method,
+-            # FastMCP-specific attributes
+-            "fastmcp.component.key": component_key,
+-        }
+-        if session_id:
+-            attrs["mcp.session.id"] = session_id
+-        if resource_uri:
+-            attrs["mcp.resource.uri"] = resource_uri
+-        span.set_attributes(attrs)
++        if span.is_recording():
++            attrs: dict[str, str] = {
++                # MCP semantic conventions
++                "mcp.method.name": method,
++                # FastMCP-specific attributes
++                "fastmcp.component.key": component_key,
++            }
++            if session_id is not None:
++                attrs["mcp.session.id"] = session_id
++            if resource_uri:
++                attrs["mcp.resource.uri"] = resource_uri
++            if tool_name is not None:
++                attrs["gen_ai.tool.name"] = tool_name
++            if prompt_name is not None:
++                attrs["gen_ai.prompt.name"] = prompt_name
++            span.set_attributes(attrs)
+         try:
+             yield span
+         except Exception as e:
+-            span.record_exception(e)
+-            span.set_status(Status(StatusCode.ERROR))
++            if span.is_recording():
++                error_type = (
++                    "tool_error" if isinstance(e, _ToolError) else type(e).__qualname__
++                )
++                span.set_attribute("error.type", error_type)
++                span.record_exception(e)
++                span.set_status(Status(StatusCode.ERROR, str(e)))
+             raise
+ 
+ 
+diff --git a/src/fastmcp/server/providers/aggregate.py b/src/fastmcp/server/providers/aggregate.py
+index c881595..8d37ef8 100644
+--- a/src/fastmcp/server/providers/aggregate.py
++++ b/src/fastmcp/server/providers/aggregate.py
+@@ -74,6 +74,7 @@ class AggregateProvider(Provider):
+         """
+         super().__init__()
+         self.providers: list[Provider] = list(providers or [])
++        self._on_duplicate: str = "warn"
+ 
+     def add_provider(self, provider: Provider, *, namespace: str = "") -> None:
+         """Add a provider with optional namespace.
+@@ -106,16 +107,44 @@ class AggregateProvider(Provider):
+     def _collect_list_results(
+         self, results: list[Sequence[T] | BaseException], operation: str
+     ) -> list[T]:
+-        """Collect successful list results, logging any exceptions."""
++        """Collect successful list results, logging any exceptions.
++
++        Detects duplicate component names across providers and applies
++        the on_duplicate behavior (error/warn/replace/ignore).
++        """
+         collected: list[T] = []
++        # Track (name, provider_index) to allow version variants from same provider
++        seen_names: dict[str, int] = {}  # name -> provider index of first occurrence
+         for i, result in enumerate(results):
+             if isinstance(result, BaseException):
+-                logger.debug(
++                logger.warning(
+                     f"Error during {operation} from provider "
+                     f"{self.providers[i]}: {result}"
+                 )
+                 continue
+-            collected.extend(result)
++            for item in result:
++                # Extract identity key: name, uri, or uri_template
++                name = (
++                    getattr(item, "name", None)
++                    or getattr(item, "uri", None)
++                    or getattr(item, "uri_template", None)
++                )
++                if name is not None:
++                    name = str(name)
++                    if name in seen_names and seen_names[name] != i:
++                        # Duplicate from a DIFFERENT provider — flag it
++                        msg = (
++                            f"Duplicate {operation} component '{name}' "
++                            f"from provider {self.providers[i]} "
++                            f"(first seen from provider "
++                            f"{self.providers[seen_names[name]]})"
++                        )
++                        if self._on_duplicate == "error":
++                            raise ValueError(msg)
++                        elif self._on_duplicate == "warn":
++                            logger.warning(msg)
++                    seen_names.setdefault(name, i)
++                collected.append(item)
+         return collected
+ 
+     def _get_highest_version_result(
+@@ -132,7 +161,7 @@ class AggregateProvider(Provider):
+         for i, result in enumerate(results):
+             if isinstance(result, BaseException):
+                 if not isinstance(result, NotFoundError):
+-                    logger.debug(
++                    logger.warning(
+                         f"Error during {operation} from provider "
+                         f"{self.providers[i]}: {result}"
+                     )
+diff --git a/src/fastmcp/server/providers/fastmcp_provider.py b/src/fastmcp/server/providers/fastmcp_provider.py
+index f13b241..28448f2 100644
+--- a/src/fastmcp/server/providers/fastmcp_provider.py
++++ b/src/fastmcp/server/providers/fastmcp_provider.py
+@@ -139,7 +139,10 @@ class FastMCPProviderTool(Tool):
+         version = VersionSpec(eq=self.version) if self.version else None
+ 
+         with delegate_span(
+-            self._original_name or "", "FastMCPProvider", self._original_name or ""
++            self._original_name or "",
++            "FastMCPProvider",
++            self._original_name or "",
++            method="tools/call",
+         ):
+             return await self._server.call_tool(
+                 self._original_name,
+@@ -232,7 +235,10 @@ class FastMCPProviderResource(Resource):
+         version = VersionSpec(eq=self.version) if self.version else None
+ 
+         with delegate_span(
+-            self._original_uri or "", "FastMCPProvider", self._original_uri or ""
++            self._original_uri or "",
++            "FastMCPProvider",
++            self._original_uri or "",
++            method="resources/read",
+         ):
+             return await self._server.read_resource(
+                 self._original_uri, version=version, task_meta=task_meta
+@@ -311,7 +317,10 @@ class FastMCPProviderPrompt(Prompt):
+         version = VersionSpec(eq=self.version) if self.version else None
+ 
+         with delegate_span(
+-            self._original_name or "", "FastMCPProvider", self._original_name or ""
++            self._original_name or "",
++            "FastMCPProvider",
++            self._original_name or "",
++            method="prompts/get",
+         ):
+             return await self._server.render_prompt(
+                 self._original_name, arguments, version=version, task_meta=task_meta
+@@ -430,7 +439,10 @@ class FastMCPProviderResourceTemplate(ResourceTemplate):
+         version = VersionSpec(eq=self.version) if self.version else None
+ 
+         with delegate_span(
+-            original_uri, "FastMCPProvider", self._original_uri_template or ""
++            original_uri,
++            "FastMCPProvider",
++            self._original_uri_template or "",
++            method="resources/read",
+         ):
+             return await self._server.read_resource(
+                 original_uri, version=version, task_meta=task_meta
+diff --git a/src/fastmcp/server/providers/proxy.py b/src/fastmcp/server/providers/proxy.py
+index b59024c..4876d7d 100644
+--- a/src/fastmcp/server/providers/proxy.py
++++ b/src/fastmcp/server/providers/proxy.py
+@@ -119,7 +119,10 @@ class ProxyTool(Tool):
+         """Executes the tool by making a call through the client."""
+         backend_name = self._backend_name or self.name
+         with client_span(
+-            f"tools/call {backend_name}", "tools/call", backend_name
++            f"tools/call {backend_name}",
++            "tools/call",
++            backend_name,
++            tool_name=backend_name,
+         ) as span:
+             span.set_attribute("fastmcp.provider.type", "ProxyProvider")
+             client = await self._get_client()
+@@ -235,7 +238,7 @@ class ProxyResource(Resource):
+ 
+         backend_uri = self._backend_uri or str(self.uri)
+         with client_span(
+-            f"resources/read {backend_uri}",
++            "resources/read",
+             "resources/read",
+             backend_uri,
+             resource_uri=backend_uri,
+@@ -450,7 +453,10 @@ class ProxyPrompt(Prompt):
+         """Render the prompt by making a call through the client."""
+         backend_name = self._backend_name or self.name
+         with client_span(
+-            f"prompts/get {backend_name}", "prompts/get", backend_name
++            f"prompts/get {backend_name}",
++            "prompts/get",
++            backend_name,
++            prompt_name=backend_name,
+         ) as span:
+             span.set_attribute("fastmcp.provider.type", "ProxyProvider")
+             client = await self._get_client()
+diff --git a/src/fastmcp/server/server.py b/src/fastmcp/server/server.py
+index 789bc42..e8cf365 100644
+--- a/src/fastmcp/server/server.py
++++ b/src/fastmcp/server/server.py
+@@ -1134,7 +1134,12 @@ class FastMCP(
+             # Core logic: find and execute tool (providers queried in parallel)
+             # Use get_tool to apply transforms and filter disabled
+             with server_span(
+-                f"tools/call {name}", "tools/call", self.name, "tool", name
++                f"tools/call {name}",
++                "tools/call",
++                self.name,
++                "tool",
++                name,
++                tool_name=name,
+             ) as span:
+                 # Try normal resolution first. If that fails and the name
+                 # contains "___" (app tool prefix), parse out the app name
+@@ -1263,7 +1268,7 @@ class FastMCP(
+ 
+             # Core logic: find and read resource (providers queried in parallel)
+             with server_span(
+-                f"resources/read {uri}",
++                "resources/read",
+                 "resources/read",
+                 self.name,
+                 "resource",
+@@ -1416,7 +1421,12 @@ class FastMCP(
+             # Core logic: find and render prompt (providers queried in parallel)
+             # Use get_prompt to apply transforms and filter disabled
+             with server_span(
+-                f"prompts/get {name}", "prompts/get", self.name, "prompt", name
++                f"prompts/get {name}",
++                "prompts/get",
++                self.name,
++                "prompt",
++                name,
++                prompt_name=name,
+             ) as span:
+                 prompt = await self.get_prompt(name, version=version)
+                 if prompt is None:
+@@ -1984,6 +1994,15 @@ class FastMCP(
+                 if not isinstance(server, FastMCPProxy):
+                     server = FastMCP.as_proxy(server)
+ 
++        # Warn if parent masks errors but child doesn't (or vice versa)
++        if self._mask_error_details and not server._mask_error_details:
++            logger.warning(
++                f"Parent server {self.name!r} has mask_error_details=True but "
++                f"mounted server {server.name!r} does not. Error details from "
++                f"{server.name!r} may leak through to clients. Set "
++                f"mask_error_details=True on the child server to prevent this."
++            )
++
+         # Create provider and add it with namespace
+         provider: Provider = FastMCPProvider(server)
+ 
+diff --git a/src/fastmcp/server/telemetry.py b/src/fastmcp/server/telemetry.py
+index 6c26322..974d4dc 100644
+--- a/src/fastmcp/server/telemetry.py
++++ b/src/fastmcp/server/telemetry.py
+@@ -7,6 +7,7 @@ from mcp.server.lowlevel.server import request_ctx
+ from opentelemetry.context import Context
+ from opentelemetry.trace import Span, SpanKind, Status, StatusCode
+ 
++from fastmcp.exceptions import ToolError as _ToolError
+ from fastmcp.telemetry import extract_trace_context, get_tracer
+ 
+ 
+@@ -60,6 +61,8 @@ def server_span(
+     component_type: str,
+     component_key: str,
+     resource_uri: str | None = None,
++    tool_name: str | None = None,
++    prompt_name: str | None = None,
+ ) -> Generator[Span, None, None]:
+     """Create a SERVER span with standard MCP attributes and auth context.
+ 
+@@ -71,28 +74,34 @@ def server_span(
+         context=_get_parent_trace_context(),
+         kind=SpanKind.SERVER,
+     ) as span:
+-        attrs: dict[str, str] = {
+-            # RPC semantic conventions
+-            "rpc.system": "mcp",
+-            "rpc.service": server_name,
+-            "rpc.method": method,
+-            # MCP semantic conventions
+-            "mcp.method.name": method,
+-            # FastMCP-specific attributes
+-            "fastmcp.server.name": server_name,
+-            "fastmcp.component.type": component_type,
+-            "fastmcp.component.key": component_key,
+-            **get_auth_span_attributes(),
+-            **get_session_span_attributes(),
+-        }
+-        if resource_uri is not None:
+-            attrs["mcp.resource.uri"] = resource_uri
+-        span.set_attributes(attrs)
++        if span.is_recording():
++            attrs: dict[str, str] = {
++                # MCP semantic conventions
++                "mcp.method.name": method,
++                # FastMCP-specific attributes
++                "fastmcp.server.name": server_name,
++                "fastmcp.component.type": component_type,
++                "fastmcp.component.key": component_key,
++                **get_auth_span_attributes(),
++                **get_session_span_attributes(),
++            }
++            if resource_uri is not None:
++                attrs["mcp.resource.uri"] = resource_uri
++            if tool_name is not None:
++                attrs["gen_ai.tool.name"] = tool_name
++            if prompt_name is not None:
++                attrs["gen_ai.prompt.name"] = prompt_name
++            span.set_attributes(attrs)
+         try:
+             yield span
+         except Exception as e:
+-            span.record_exception(e)
+-            span.set_status(Status(StatusCode.ERROR))
++            if span.is_recording():
++                error_type = (
++                    "tool_error" if isinstance(e, _ToolError) else type(e).__qualname__
++                )
++                span.set_attribute("error.type", error_type)
++                span.record_exception(e)
++                span.set_status(Status(StatusCode.ERROR, str(e)))
+             raise
+ 
+ 
+@@ -101,6 +110,7 @@ def delegate_span(
+     name: str,
+     provider_type: str,
+     component_key: str,
++    method: str | None = None,
+ ) -> Generator[Span, None, None]:
+     """Create an INTERNAL span for provider delegation.
+ 
+@@ -109,17 +119,24 @@ def delegate_span(
+     """
+     tracer = get_tracer()
+     with tracer.start_as_current_span(f"delegate {name}") as span:
+-        span.set_attributes(
+-            {
++        if span.is_recording():
++            attrs: dict[str, str] = {
+                 "fastmcp.provider.type": provider_type,
+                 "fastmcp.component.key": component_key,
+             }
+-        )
++            if method is not None:
++                attrs["mcp.method.name"] = method
++            span.set_attributes(attrs)
+         try:
+             yield span
+         except Exception as e:
+-            span.record_exception(e)
+-            span.set_status(Status(StatusCode.ERROR))
++            if span.is_recording():
++                error_type = (
++                    "tool_error" if isinstance(e, _ToolError) else type(e).__qualname__
++                )
++                span.set_attribute("error.type", error_type)
++                span.record_exception(e)
++                span.set_status(Status(StatusCode.ERROR, str(e)))
+             raise
+ 
+ 

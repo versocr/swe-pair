@@ -1,0 +1,165 @@
+diff --git a/docs/changelog/3831.feature.rst b/docs/changelog/3831.feature.rst
+new file mode 100644
+index 0000000000..ec76d359aa
+--- /dev/null
++++ b/docs/changelog/3831.feature.rst
+@@ -0,0 +1,2 @@
++Show clean error messages instead of stack traces when TOML configuration contains type mismatches (e.g., ``deps =
++[1]``), wrapping failures in ``HandledError`` with environment and key context - by :user:`gaborbernat`.
+diff --git a/src/tox/config/loader/memory.py b/src/tox/config/loader/memory.py
+index 6e2ac4df21..cc521760e0 100644
+--- a/src/tox/config/loader/memory.py
++++ b/src/tox/config/loader/memory.py
+@@ -58,7 +58,8 @@ def to_command(value: Any) -> Command | None:
+             return value
+         if isinstance(value, str):
+             return StrConvert.to_command(value)
+-        raise TypeError(value)
++        msg = f"command expected Command or str, got {type(value).__name__}: {value!r}"
++        raise TypeError(msg)
+ 
+     @staticmethod
+     def to_env_list(value: Any) -> EnvList:
+@@ -66,4 +67,5 @@ def to_env_list(value: Any) -> EnvList:
+             return value
+         if isinstance(value, str):
+             return StrConvert.to_env_list(value)
+-        raise TypeError(value)
++        msg = f"env_list expected EnvList or str, got {type(value).__name__}: {value!r}"
++        raise TypeError(msg)
+diff --git a/src/tox/config/loader/toml/__init__.py b/src/tox/config/loader/toml/__init__.py
+index dac45ac785..c31528553f 100644
+--- a/src/tox/config/loader/toml/__init__.py
++++ b/src/tox/config/loader/toml/__init__.py
+@@ -6,7 +6,7 @@
+ from typing import TYPE_CHECKING, Any, TypeVar, cast
+ 
+ from tox.config.loader.api import ConfigLoadArgs, Loader, Override
+-from tox.config.loader.replacer import replace
++from tox.config.loader.replacer import MatchError, replace
+ from tox.config.set_env import SetEnv
+ from tox.config.types import Command, EnvList
+ from tox.report import HandledError
+@@ -62,7 +62,7 @@ def load_raw_from_root(self, path: str) -> TomlTypes:
+ 
+     def build(  # noqa: PLR0913
+         self,
+-        key: str,  # noqa: ARG002
++        key: str,
+         of_type: type[_T] | UnionType,
+         factory: Factory[_T],
+         conf: Config | None,
+@@ -70,9 +70,16 @@ def build(  # noqa: PLR0913
+         args: ConfigLoadArgs,
+     ) -> _T:
+         delay_replace = inspect.isclass(of_type) and issubclass(of_type, SetEnv)
+-        unroll = Unroll(conf=conf, loader=self, args=args)
+-        exploded = unroll(raw, skip_str=True) if delay_replace else unroll(raw)
+-        result = self.to(exploded, of_type, factory)
++        try:
++            unroll = Unroll(conf=conf, loader=self, args=args)
++            exploded = unroll(raw, skip_str=True) if delay_replace else unroll(raw)
++            result = self.to(exploded, of_type, factory)
++        except (HandledError, MatchError):
++            raise
++        except Exception as exception:
++            name = "core" if args.env_name is None else args.env_name
++            msg = f"failed to load {name}.{key}: {exception}"
++            raise HandledError(msg) from exception
+         if delay_replace:
+             loader = self
+ 
+diff --git a/src/tox/config/sets.py b/src/tox/config/sets.py
+index bb92e0a746..c6c7733d55 100644
+--- a/src/tox/config/sets.py
++++ b/src/tox/config/sets.py
+@@ -287,7 +287,10 @@ def is_valid_value(v: object) -> bool:
+                     )
+                 )
+             ):
+-                raise TypeError(raw)
++                msg = (
++                    f"set_env expected str, dict[str, str], or list[dict[str, str]], got {type(raw).__name__}: {raw!r}"
++                )
++                raise TypeError(msg)
+             return SetEnv(cast("SetEnvRaw", raw), self.name, self.env_name, root)
+ 
+         root = self._conf.core["tox_root"]
+diff --git a/src/tox/session/cmd/run/single.py b/src/tox/session/cmd/run/single.py
+index f2ba87d7b2..ed869cfd84 100644
+--- a/src/tox/session/cmd/run/single.py
++++ b/src/tox/session/cmd/run/single.py
+@@ -7,6 +7,7 @@
+ from typing import TYPE_CHECKING, NamedTuple, cast
+ 
+ from tox.execute.api import Outcome, StdinSource
++from tox.report import HandledError
+ from tox.tox_env.errors import Fail, Skip
+ from tox.tox_env.python.virtual_env.package.pyproject import ToxBackendFailed
+ 
+@@ -60,6 +61,9 @@ def _evaluate(tox_env: RunToxEnv, no_test: bool) -> tuple[bool, int, list[Outcom
+         except Fail as exception:
+             LOGGER.error("failed with %s", exception)  # noqa: TRY400
+             code = 1
++        except HandledError as exception:
++            LOGGER.error("%s", exception)  # noqa: TRY400
++            code = 1
+         except Exception:  # pragma: no cover
+             LOGGER.exception("internal error")  # pragma: no cover
+             code = 2  # pragma: no cover
+diff --git a/src/tox/tox_env/python/pip/req_file.py b/src/tox/tox_env/python/pip/req_file.py
+index 5f312f8223..84a8bcef12 100644
+--- a/src/tox/tox_env/python/pip/req_file.py
++++ b/src/tox/tox_env/python/pip/req_file.py
+@@ -142,7 +142,7 @@ def factory(cls, root: Path, raw: object) -> PythonDeps:
+                 and (all(isinstance(i, str) for i in raw) or all(isinstance(i, Requirement) for i in raw))
+             )
+         ):
+-            raise TypeError(raw)
++            raise TypeError(_factory_type_error("deps", raw))
+         return cls(cast("str | list[str] | list[Requirement]", raw), root)
+ 
+ 
+@@ -249,10 +249,20 @@ def factory(cls, root: Path, raw: object) -> PythonConstraints:
+                 and (all(isinstance(i, str) for i in raw) or all(isinstance(i, Requirement) for i in raw))
+             )
+         ):
+-            raise TypeError(raw)
++            raise TypeError(_factory_type_error("constraints", raw))
+         return cls(cast("str | list[str] | list[Requirement]", raw), root)
+ 
+ 
++def _factory_type_error(field: str, raw: object) -> str:
++    expected = "str, list[str], or list[Requirement]"
++    if isinstance(raw, list):
++        bad_items = ", ".join(
++            f"[{i}] {type(item).__name__}" for i, item in enumerate(raw) if not isinstance(item, (str, Requirement))
++        )
++        return f"{field} expected {expected}, got list with invalid items: {bad_items}"
++    return f"{field} expected {expected}, got {type(raw).__name__}: {raw!r}"
++
++
+ ONE_ARG = {
+     "-i",
+     "--index-url",
+diff --git a/docs/changelog/3841.bugfix.rst b/docs/changelog/3841.bugfix.rst
+new file mode 100644
+index 0000000000..1269f38a42
+--- /dev/null
++++ b/docs/changelog/3841.bugfix.rst
+@@ -0,0 +1,2 @@
++Pass stdin through to commands executed via ``tox exec`` so that piped input (e.g., ``echo "foo" | tox exec -- python -c
++'import sys; print(sys.stdin.read())'``) reaches the subprocess instead of being discarded - by :user:`gaborbernat`.
+diff --git a/src/tox/session/cmd/run/single.py b/src/tox/session/cmd/run/single.py
+index ed869cfd84..58d8174a80 100644
+--- a/src/tox/session/cmd/run/single.py
++++ b/src/tox/session/cmd/run/single.py
+@@ -118,7 +118,7 @@ def run_command_set(  # noqa: PLR0913
+             current_outcome = tox_env.execute(
+                 cmd.args,
+                 cwd=cwd,
+-                stdin=StdinSource.user_only(),
++                stdin=StdinSource.USER if getattr(tox_env.options, "no_capture", False) else StdinSource.user_only(),
+                 show=True,
+                 run_id=f"{key}[{at}]",
+             )

@@ -1,0 +1,436 @@
+diff --git a/tests/maxo_dialog/manager/test_bg_manager.py b/tests/maxo_dialog/manager/test_bg_manager.py
+index 947c534..7141a12 100644
+--- a/tests/maxo_dialog/manager/test_bg_manager.py
++++ b/tests/maxo_dialog/manager/test_bg_manager.py
+@@ -1,4 +1,5 @@
+ import asyncio
++from collections.abc import Callable, Coroutine
+ from typing import Any, cast
+ from unittest.mock import AsyncMock, MagicMock
+ 
+@@ -14,6 +15,8 @@ from maxo.dialogs.api.entities import (
+     ShowMode,
+     StartMode,
+ )
++from maxo.dialogs.api.entities.update_event import DialogFgEvent
++from maxo.dialogs.api.exceptions import DialogsError
+ from maxo.dialogs.api.internal import FakeUser
+ from maxo.dialogs.manager.bg_manager import BgManager, BgManagerFactoryImpl
+ from maxo.dialogs.manager.updater import Updater
+@@ -244,7 +247,7 @@ class TestForeground:
+ 
+         def notify_task(bot: Any, update: Any) -> Any:
+             update.entered.set_result(inner)
+-            return asyncio.sleep(0)
++            return asyncio.create_task(asyncio.sleep(0))
+ 
+         manager._updater.notify_task = MagicMock(side_effect=notify_task)  # type: ignore[method-assign]
+ 
+@@ -258,7 +261,7 @@ class TestForeground:
+         def notify_task(bot: Any, update: Any) -> Any:
+             events.append(update)
+             update.entered.set_result(MagicMock())
+-            return asyncio.sleep(0)
++            return asyncio.create_task(asyncio.sleep(0))
+ 
+         manager._updater.notify_task = MagicMock(side_effect=notify_task)  # type: ignore[method-assign]
+ 
+@@ -268,6 +271,71 @@ class TestForeground:
+ 
+         assert events[0].exited.exception() is not None
+ 
++    async def test_fg_raises_error_of_failed_event(self) -> None:
++        manager = make_manager()
++
++        async def process(update: DialogFgEvent) -> None:
++            raise RuntimeError("boom")
++
++        mock_notify_task(manager, process)
++        task = asyncio.create_task(enter_fg(manager))
++        await wait_done(task)
++
++        with pytest.raises(RuntimeError, match="boom"):
++            task.result()
++
++    async def test_fg_raises_when_event_is_not_handled(self) -> None:
++        manager = make_manager()
++
++        async def process(update: DialogFgEvent) -> None:
++            pass
++
++        mock_notify_task(manager, process)
++        task = asyncio.create_task(enter_fg(manager))
++        await wait_done(task)
++
++        with pytest.raises(DialogsError):
++            task.result()
++
++    async def test_fg_cancelled_before_enter_does_not_wait_event(self) -> None:
++        manager = make_manager()
++
++        async def process(update: DialogFgEvent) -> None:
++            await asyncio.Event().wait()
++
++        notify_tasks = mock_notify_task(manager, process)
++        task = asyncio.create_task(enter_fg(manager))
++        await asyncio.sleep(0)
++        task.cancel()
++        await wait_done(task)
++        notify_tasks[0].cancel()
++
++        assert task.cancelled()
++
++    async def test_fg_cancelled_inside_body_releases_event(self) -> None:
++        manager = make_manager()
++        events: list[DialogFgEvent] = []
++        inside = asyncio.Event()
++
++        async def process(update: DialogFgEvent) -> None:
++            events.append(update)
++            update.entered.set_result(MagicMock())
++            await update.exited
++
++        async def use_fg() -> None:
++            async with manager.fg():
++                inside.set()
++                await asyncio.Event().wait()
++
++        mock_notify_task(manager, process)
++        task = asyncio.create_task(use_fg())
++        await inside.wait()
++        task.cancel()
++        await wait_done(task)
++
++        assert task.cancelled()
++        assert events[0].exited.cancelled()
++
+ 
+ class TestFactory:
+     def test_builds_bg_manager(self) -> None:
+@@ -291,3 +359,27 @@ class TestFactory:
+ 
+         assert isinstance(manager, BgManager)
+         assert manager.stack_id == "s"
++
++
++def mock_notify_task(
++    manager: BgManager,
++    process: Callable[[DialogFgEvent], Coroutine[Any, Any, None]],
++) -> list[asyncio.Task[None]]:
++    tasks: list[asyncio.Task[None]] = []
++
++    def notify_task(bot: Any, update: DialogFgEvent) -> asyncio.Task[None]:
++        tasks.append(asyncio.create_task(process(update)))
++        return tasks[-1]
++
++    manager._updater.notify_task = MagicMock(side_effect=notify_task)  # type: ignore[method-assign]
++    return tasks
++
++
++async def enter_fg(manager: BgManager) -> None:
++    async with manager.fg():
++        pass
++
++
++async def wait_done(task: asyncio.Task[None]) -> None:
++    await asyncio.wait([task], timeout=1)
++    assert task.done(), "fg() завис"
+diff --git a/tests/maxo_dialog/manager/test_manager_impl.py b/tests/maxo_dialog/manager/test_manager_impl.py
+index a6117d8..58134fe 100644
+--- a/tests/maxo_dialog/manager/test_manager_impl.py
++++ b/tests/maxo_dialog/manager/test_manager_impl.py
+@@ -24,7 +24,7 @@ from maxo.dialogs.api.exceptions import (
+     InvalidKeyboardType,
+     NoContextError,
+ )
+-from maxo.dialogs.api.internal import CONTEXT_KEY, STACK_KEY, STORAGE_KEY
++from maxo.dialogs.api.internal import CONTEXT_KEY, STACK_KEY, STORAGE_KEY, FakeUser
+ from maxo.dialogs.api.protocols import MessageNotModified
+ from maxo.dialogs.manager.bg_manager import BgManager
+ from maxo.dialogs.manager.manager import ManagerImpl
+@@ -40,6 +40,7 @@ from maxo.types import (
+     MessageBody,
+     MessageButton,
+     MessageCallback,
++    MessageCreated,
+     Recipient,
+     UpdateContext,
+ )
+@@ -464,15 +465,30 @@ class TestBackground:
+ 
+         assert isinstance(user, BgManager)
+ 
+-    def test_get_fake_user_unwraps_error_event(self) -> None:
+-        inner = make_callback(with_message=False)
+-        error_event: ErrorEvent[RuntimeError, MessageCallback] = ErrorEvent(
+-            exception=RuntimeError("x"),
+-            update=MaxoUpdate(update=inner),
++    def test_get_fake_user_takes_user_from_event_context(self) -> None:
++        manager = make_manager(event=make_callback(with_message=False))
++        event_context: EventContext = manager.middleware_data[EVENT_CONTEXT_KEY]
++
++        assert manager._get_fake_user() is event_context.user
++
++    def test_get_fake_user_for_event_without_user(self) -> None:
++        channel_post = MessageCreated(
++            timestamp=NOW,
++            message=Message(
++                timestamp=NOW,
++                recipient=Recipient(chat_type=ChatType.CHANNEL, chat_id=10),
++                body=MessageBody(mid="m", seq=1, text="post"),
++            ),
+         )
+-        manager = make_manager(event=error_event)
++        manager = make_manager(event=channel_post, chat_type=ChatType.CHANNEL)
++        event_context: EventContext = manager.middleware_data[EVENT_CONTEXT_KEY]
++        event_context.user = None
++        event_context.user_id = None
++
++        user = manager._get_fake_user(42)
+ 
+-        assert manager._get_fake_user() is inner.callback.user
++        assert isinstance(user, FakeUser)
++        assert user.id == 42
+ 
+     def test_get_fake_chat_requires_chat_id_without_update_context(self) -> None:
+         manager = make_manager()
+diff --git a/tests/maxo_dialog/manager/test_update_handler.py b/tests/maxo_dialog/manager/test_update_handler.py
+index b289c60..7fba81b 100644
+--- a/tests/maxo_dialog/manager/test_update_handler.py
++++ b/tests/maxo_dialog/manager/test_update_handler.py
+@@ -213,3 +213,25 @@ async def test_handle_dialog_start_event_with_none_show_mode(
+     await handle_aiogd_update(event, mock_dialog_manager)
+ 
+     assert mock_dialog_manager.show_mode == ShowMode.AUTO
++
++
++async def test_handle_dialog_fg_event_skips_cancelled_fg(
++    mock_dialog_manager: MagicMock,
++) -> None:
++    entered: Future[DialogManager] = Future()
++    entered.cancel()
++    event = DialogFgEvent(
++        user=MagicMock(),
++        recipient=MagicMock(),
++        action=DialogAction.FG,
++        data=None,
++        intent_id=None,
++        stack_id=None,
++        bot=MagicMock(),
++        entered=entered,
++        exited=Future(),
++    )
++
++    await handle_aiogd_update(event, mock_dialog_manager)
++
++    assert entered.cancelled()
+diff --git a/tests/maxo_dialog/test_channel_messages.py b/tests/maxo_dialog/test_channel_messages.py
+index c0f6c76..1f1d4db 100644
+--- a/tests/maxo_dialog/test_channel_messages.py
++++ b/tests/maxo_dialog/test_channel_messages.py
+@@ -6,21 +6,27 @@ from typing import Any
+ import pytest
+ 
+ from maxo import Ctx, Dispatcher, Router
+-from maxo.dialogs import setup_dialogs
++from maxo.dialogs import Dialog, DialogManager, StartMode, Window, setup_dialogs
+ from maxo.dialogs.api.entities import AccessSettings, EventContext, Stack
+ from maxo.dialogs.api.entities.events import EVENT_CONTEXT_KEY
+ from maxo.dialogs.context.access_validator import DefaultAccessValidator
++from maxo.dialogs.manager.bg_manager import BgManagerFactoryImpl
+ from maxo.dialogs.test_tools import BotClient, MockMessageManager
+ from maxo.dialogs.test_tools.memory_storage import JsonMemoryStorage
++from maxo.dialogs.widgets.text import Const
+ from maxo.enums import ChatType
++from maxo.fsm import State, StatesGroup
+ from maxo.fsm.key_builder import DefaultKeyBuilder
+ from maxo.routing.middlewares.update_context import (
+     EVENT_FROM_USER_KEY,
+     UPDATE_CONTEXT_KEY,
+ )
++from maxo.routing.signals import AfterStartup, BeforeStartup
+ from maxo.types import Message, MessageBody, MessageCreated, Recipient
+ from maxo.types.update_context import UpdateContext
+ 
++from .conftest import wait_for_messages
++
+ 
+ @pytest.fixture
+ def captured_ctx() -> dict[str, Any]:
+@@ -171,3 +177,118 @@ async def test_access_validator_denies_when_user_required_but_missing(
+     )
+ 
+     assert allowed is False
++
++
++class ChannelSG(StatesGroup):
++    post = State()
++
++
++async def test_start_new_stack_from_channel_post(
++    message_manager: MockMessageManager,
++) -> None:
++    router = Router()
++
++    @router.message_created()
++    async def handler(event: MessageCreated, dialog_manager: DialogManager) -> None:
++        await dialog_manager.start(ChannelSG.post, mode=StartMode.NEW_STACK)
++
++    client = await start_channel_client(
++        message_manager,
++        router,
++        Dialog(Window(Const("channel window"), state=ChannelSG.post)),
++    )
++
++    await client.send_channel_post("post")
++
++    await wait_for_messages(message_manager)
++    assert message_manager.one_message().body.text == "channel window"
++
++
++class ChannelDefaultSG(StatesGroup):
++    first = State()
++    second = State()
++
++
++async def test_bg_switch_to_from_channel_post_reaches_default_stack(
++    message_manager: MockMessageManager,
++) -> None:
++    router = Router()
++
++    @router.message_created()
++    async def handler(event: MessageCreated, dialog_manager: DialogManager) -> None:
++        if event.message.body.text == "start":
++            await dialog_manager.start(ChannelDefaultSG.first)
++        else:
++            await dialog_manager.bg().switch_to(ChannelDefaultSG.second)
++
++    client = await start_channel_client(
++        message_manager,
++        router,
++        Dialog(
++            Window(Const("first"), state=ChannelDefaultSG.first),
++            Window(Const("second"), state=ChannelDefaultSG.second),
++        ),
++    )
++
++    await client.send_channel_post("start")
++    await client.send_channel_post("switch")
++
++    await wait_for_messages(message_manager, count=2)
++    assert message_manager.last_message().body.text == "second"
++
++
++async def start_channel_client(
++    message_manager: MockMessageManager,
++    router: Router,
++    dialog: Dialog,
++) -> BotClient:
++    dp = Dispatcher(
++        storage=JsonMemoryStorage(),
++        key_builder=DefaultKeyBuilder(with_destiny=True),
++    )
++    dp.include_router(router)
++    dp.include_router(dialog)
++    setup_dialogs(dp, message_manager=message_manager)
++    client = BotClient(dp, user_id=1, chat_id=-100, chat_type=ChatType.CHANNEL)
++    await dp.feed_signal(BeforeStartup(), client.bot)
++    await dp.feed_signal(AfterStartup(), client.bot)
++    return client
++
++
++async def test_bg_factory_without_user_reaches_channel_default_stack(
++    message_manager: MockMessageManager,
++) -> None:
++    router = Router()
++    users: list[Any] = []
++
++    @router.message_created()
++    async def handler(event: MessageCreated, dialog_manager: DialogManager) -> None:
++        await dialog_manager.start(ChannelDefaultSG.first)
++
++    async def getter(dialog_manager: DialogManager, **_: Any) -> dict[str, Any]:
++        users.append(dialog_manager.middleware_data[EVENT_CONTEXT_KEY].user)
++        return {}
++
++    client = await start_channel_client(
++        message_manager,
++        router,
++        Dialog(
++            Window(Const("first"), state=ChannelDefaultSG.first),
++            Window(Const("second"), state=ChannelDefaultSG.second, getter=getter),
++        ),
++    )
++
++    await client.send_channel_post("start")
++    await wait_for_messages(message_manager)
++
++    bg = BgManagerFactoryImpl(client.dp).bg(
++        bot=client.bot,
++        user_id=None,
++        chat_id=-100,
++        chat_type=ChatType.CHANNEL,
++    )
++    await bg.switch_to(ChannelDefaultSG.second)
++
++    await wait_for_messages(message_manager, count=2)
++    assert message_manager.last_message().body.text == "second"
++    assert users == [None]
+diff --git a/tests/maxo_dialog/test_fg.py b/tests/maxo_dialog/test_fg.py
+index 2126395..1738eaa 100644
+--- a/tests/maxo_dialog/test_fg.py
++++ b/tests/maxo_dialog/test_fg.py
+@@ -13,9 +13,10 @@ from maxo.dialogs import (
+     setup_dialogs,
+ )
+ from maxo.dialogs.api.entities import AccessSettings
+-from maxo.dialogs.api.exceptions import StackAccessDeniedError
++from maxo.dialogs.api.exceptions import StackAccessDeniedError, UnknownIntent
++from maxo.dialogs.api.internal import FakeUser
+ from maxo.dialogs.api.protocols import BaseDialogManager
+-from maxo.dialogs.manager.bg_manager import BgManagerFactoryImpl
++from maxo.dialogs.manager.bg_manager import BgManager, BgManagerFactoryImpl
+ from maxo.dialogs.test_tools import BotClient, MockMessageManager
+ from maxo.dialogs.test_tools.keyboard import InlineButtonTextLocator
+ from maxo.dialogs.test_tools.memory_storage import JsonMemoryStorage
+@@ -26,6 +27,7 @@ from maxo.fsm.state import State, StatesGroup
+ from maxo.routing.filters import CommandStart
+ from maxo.routing.signals import AfterStartup, BeforeStartup
+ from maxo.types import ErrorEvent
++from tests.constants import NOW
+ 
+ from .conftest import wait_for_messages
+ 
+@@ -210,3 +212,32 @@ async def test_fg_raises_for_forbidden_stack(
+     with pytest.raises(StackAccessDeniedError):
+         async with asyncio.timeout(1), stranger.fg():
+             pass
++
++
++async def test_fg_raises_for_unknown_intent(
++    dp: Dispatcher,
++    client: BotClient,
++    message_manager: MockMessageManager,
++) -> None:
++    await start_stack_for_first_user(dp, client, message_manager)
++    stale = BgManager(
++        user=FakeUser(user_id=1, is_bot=False, first_name="", last_activity_time=NOW),
++        chat_id=-1,
++        bot=client.bot,
++        dp=dp,
++        intent_id="missing",
++        stack_id=SHARED_STACK_ID,
++        load=False,
++        chat_type=ChatType.CHAT,
++    )
++
++    async def enter_fg() -> None:
++        async with stale.fg():
++            pass
++
++    task = asyncio.create_task(enter_fg())
++    await asyncio.wait([task], timeout=1)
++
++    assert task.done(), "fg() завис"
++    with pytest.raises(UnknownIntent):
++        task.result()

@@ -1,0 +1,317 @@
+diff --git a/docs/pages/dialogs/background_manager.rst b/docs/pages/dialogs/background_manager.rst
+index e3a97580..aa200c69 100644
+--- a/docs/pages/dialogs/background_manager.rst
++++ b/docs/pages/dialogs/background_manager.rst
+@@ -26,6 +26,20 @@ BgManagerFactory
+         # Или просто обновление UI текущего диалога
+         await bg_manager.update({"status": "completed"})
+ 
++В канале посты приходят без пользователя, и диалог живёт в стеке по умолчанию самого канала.
++Чтобы достучаться до него, передайте ``user_id=None``:
++
++.. code-block:: python
++
++    from maxo.enums import ChatType
++
++    bg_manager = bg_factory.bg(
++        bot=bot,
++        chat_id=channel_id,
++        user_id=None,
++        chat_type=ChatType.CHANNEL,
++    )
++
+ .. note::
+ 
+    При использовании ``BgManagerFactory`` убедитесь, что ``Dispatcher`` инициализирован с ``KeyBuilder(with_destiny=True)`` - это необходимо для корректной работы системы диалогов.
+diff --git a/src/maxo/dialogs/api/entities/update_event.py b/src/maxo/dialogs/api/entities/update_event.py
+index 8c54277d..3c883542 100644
+--- a/src/maxo/dialogs/api/entities/update_event.py
++++ b/src/maxo/dialogs/api/entities/update_event.py
+@@ -25,7 +25,7 @@ class DialogAction(Enum):
+ 
+ 
+ class DialogUpdateEvent(BaseUpdate):
+-    user: User
++    user: User | None
+     recipient: Recipient
+     action: DialogAction
+     data: Any
+diff --git a/src/maxo/dialogs/api/protocols/manager.py b/src/maxo/dialogs/api/protocols/manager.py
+index 8eb67552..da6a67d0 100644
+--- a/src/maxo/dialogs/api/protocols/manager.py
++++ b/src/maxo/dialogs/api/protocols/manager.py
+@@ -86,7 +86,7 @@ class BgManagerFactory(Protocol):
+     def bg(
+         self,
+         bot: Bot,
+-        user_id: int,
++        user_id: int | None,
+         chat_id: int,
+         stack_id: str | None = None,
+         load: bool = False,  # load chat and user
+diff --git a/src/maxo/dialogs/context/intent_middleware.py b/src/maxo/dialogs/context/intent_middleware.py
+index 2b7fa858..21c21172 100644
+--- a/src/maxo/dialogs/context/intent_middleware.py
++++ b/src/maxo/dialogs/context/intent_middleware.py
+@@ -128,7 +128,7 @@ def event_context_from_aiogd(event: DialogUpdateEvent) -> EventContext:
+     return EventContext(
+         bot=event.bot,
+         user=event.user,
+-        user_id=event.user.user_id,
++        user_id=None if event.user is None else event.user.user_id,
+         chat=None,
+         chat_id=event.recipient.chat_id,
+         chat_type=event.recipient.chat_type,
+@@ -343,7 +343,7 @@ async def process_aiogd_update(
+             if isinstance(update, DialogFgEvent):
+                 update.entered.set_exception(
+                     StackAccessDeniedError(
+-                        f"Stack is not allowed for user {update.user.id}",
++                        f"Stack is not allowed for user {event_context.user_id}",
+                     ),
+                 )
+             return UNHANDLED
+diff --git a/src/maxo/dialogs/manager/bg_manager.py b/src/maxo/dialogs/manager/bg_manager.py
+index d98335d9..729a62bc 100644
+--- a/src/maxo/dialogs/manager/bg_manager.py
++++ b/src/maxo/dialogs/manager/bg_manager.py
+@@ -31,7 +31,7 @@
+ class BgManager(BaseDialogManager):
+     def __init__(
+         self,
+-        user: User,
++        user: User | None,
+         chat_id: int | None,
+         bot: Bot,
+         dp: Dispatcher,
+@@ -42,7 +42,7 @@ def __init__(
+     ) -> None:
+         self._event_context = EventContext(
+             chat_id=chat_id,
+-            user_id=user.id,
++            user_id=None if user is None else user.id,
+             chat_type=chat_type,
+             user=user,
+             chat=None,
+@@ -54,13 +54,12 @@ def __init__(
+         self.stack_id = stack_id
+         self.load = load
+ 
+-    def _get_fake_user(self, user_id: int | None = None) -> User:
+-        if self._event_context.user is not None and (
+-            user_id is None or user_id == self._event_context.user.id
+-        ):
+-            return self._event_context.user
++    def _get_fake_user(self, user_id: int | None = None) -> User | None:
++        user = self._event_context.user
++        if user_id is None or (user is not None and user_id == user.id):
++            return user
+         return FakeUser(
+-            user_id=user_id or 0,
++            user_id=user_id,
+             is_bot=False,
+             first_name="",
+             last_activity_time=datetime.now(UTC),
+@@ -105,12 +104,10 @@ def bg(
+         )
+ 
+     def _base_event_params(self) -> dict[str, Any]:
+-        user = self._event_context.user
+-        assert user is not None  # noqa: S101
+         return {
+-            "user": user,
++            "user": self._event_context.user,
+             "recipient": Recipient(
+-                user_id=user.id,
++                user_id=self._event_context.user_id,
+                 chat_id=self._event_context.chat_id,
+                 chat_type=self._event_context.chat_type or ChatType.CHAT,
+             ),
+@@ -129,11 +126,7 @@ async def _load(self) -> None:
+ 
+         user = self._event_context.user
+         user_id = self._event_context.user_id
+-        # `BgManager.__init__` требует `user`, а `user_id` берёт из него.
+-        assert user is not None  # noqa: S101
+-        assert user_id is not None  # noqa: S101
+-
+-        if is_user_loaded(user):
++        if user is None or user_id is None or is_user_loaded(user):
+             return
+ 
+         chat_id = self._event_context.chat_id
+@@ -259,18 +252,20 @@ def __init__(self, router: Dispatcher) -> None:
+     def bg(
+         self,
+         bot: Bot,
+-        user_id: int,
++        user_id: int | None,
+         chat_id: int,
+         stack_id: str | None = None,
+         load: bool = False,
+         chat_type: ChatType = ChatType.CHAT,
+     ) -> "BaseDialogManager":
+-        user = FakeUser(
+-            user_id=user_id,
+-            is_bot=False,
+-            first_name="",
+-            last_activity_time=datetime.now(UTC),
+-        )
++        user = None
++        if user_id is not None:
++            user = FakeUser(
++                user_id=user_id,
++                is_bot=False,
++                first_name="",
++                last_activity_time=datetime.now(UTC),
++            )
+         if stack_id is None:
+             stack_id = DEFAULT_STACK_ID
+ 
+diff --git a/src/maxo/dialogs/manager/manager.py b/src/maxo/dialogs/manager/manager.py
+index 5eb47559..6cb3b4c8 100644
+--- a/src/maxo/dialogs/manager/manager.py
++++ b/src/maxo/dialogs/manager/manager.py
+@@ -516,17 +516,11 @@ def find(self, widget_id: str) -> Widget | None:
+             return None
+         return cast(Widget, widget.managed(self))
+ 
+-    def _get_fake_user(self, user_id: int | None = None) -> User:
+-        """Get User if we have info about him or FakeUser instead."""
+-        # TODO: Сделать нормально, это нейрослоп
+-        event = self.event.event if isinstance(self.event, ErrorEvent) else self.event
+-        if isinstance(event, MessageCreated):
+-            current_user = event.message.unsafe_sender
+-        else:
+-            current_user = event.user
+-
+-        if user_id is None or user_id == current_user.id:
+-            return current_user
++    def _get_fake_user(self, user_id: int | None = None) -> User | None:
++        event_context: EventContext = self.middleware_data[EVENT_CONTEXT_KEY]
++        user = event_context.user
++        if user_id is None or (user is not None and user_id == user.id):
++            return user
+         return FakeUser(
+             user_id=user_id,
+             is_bot=False,
+@@ -576,7 +570,7 @@ def bg(
+         new_event_context = EventContext(
+             bot=event_context.bot,
+             user=user,
+-            user_id=user.id,
++            user_id=None if user is None else user.id,
+             chat=chat,
+             chat_type=chat.type,
+             chat_id=chat.id,
+diff --git a/src/maxo/dialogs/tools/preview.py b/src/maxo/dialogs/tools/preview.py
+index 70bd8cf9..08c10d8c 100644
+--- a/src/maxo/dialogs/tools/preview.py
++++ b/src/maxo/dialogs/tools/preview.py
+@@ -111,7 +111,7 @@ def __init__(self) -> None:
+                 chat_type=self._event.recipient.chat_type,
+                 chat_id=self._event.recipient.chat_id,
+                 user=self._event.user,
+-                user_id=self._event.user.user_id,
++                user_id=self._event.recipient.user_id,
+             ),
+         }
+ 
+diff --git a/src/maxo/routing/middlewares/update_context.py b/src/maxo/routing/middlewares/update_context.py
+index a026f71b..3da087ab 100644
+--- a/src/maxo/routing/middlewares/update_context.py
++++ b/src/maxo/routing/middlewares/update_context.py
+@@ -186,7 +186,7 @@ async def _resolve_update_context(
+             user_id = update.user_id
+         elif isinstance(update, DialogUpdateEvent):
+             user = update.user
+-            user_id = user.id
++            user_id = None if user is None else user.id
+             chat_id = update.recipient.chat_id
+             chat_type = update.recipient.chat_type
+ 
+diff --git a/src/maxo/dialogs/manager/bg_manager.py b/src/maxo/dialogs/manager/bg_manager.py
+index 13335b17..da6892e4 100644
+--- a/src/maxo/dialogs/manager/bg_manager.py
++++ b/src/maxo/dialogs/manager/bg_manager.py
+@@ -2,6 +2,7 @@
+ from collections.abc import AsyncIterator
+ from contextlib import asynccontextmanager
+ from datetime import UTC, datetime
++from functools import partial
+ from typing import Any
+ 
+ from maxo import Bot, Dispatcher, loggers
+@@ -19,6 +20,7 @@
+     StartMode,
+ )
+ from maxo.dialogs.api.entities.update_event import DialogFgEvent
++from maxo.dialogs.api.exceptions import DialogsError
+ from maxo.dialogs.api.internal import FakeUser
+ from maxo.dialogs.api.protocols import BaseDialogManager, BgManagerFactory
+ from maxo.dialogs.manager.updater import Updater
+@@ -232,20 +234,27 @@ async def fg(self) -> AsyncIterator[DialogManager]:
+         )
+         bot = self._event_context.bot
+         task = self._updater.notify_task(bot=bot, update=event)
++        # entered выставляет только хендлер fg, до которого событие может не дойти
++        task.add_done_callback(partial(_fail_entered, event.entered))
+         try:
+             manager = await event.entered
+-        except BaseException:
++        except asyncio.CancelledError:
++            event.exited.cancel()
++            raise
++        except Exception:
+             await task
+             raise
+         try:
+             yield manager
+         except Exception as e:
+             event.exited.set_exception(e)
+-            raise
+-        else:
+-            event.exited.set_result(None)
+-        finally:
+             await task
++            raise
++        except BaseException:
++            event.exited.cancel()
++            raise
++        event.exited.set_result(None)
++        await task
+ 
+ 
+ class BgManagerFactoryImpl(BgManagerFactory):
+@@ -282,3 +291,17 @@ def bg(
+             load=load,
+             chat_type=chat_type,
+         )
++
++
++def _fail_entered(
++    entered: asyncio.Future[DialogManager],
++    task: asyncio.Task[Any],
++) -> None:
++    if entered.done():
++        return
++    if task.cancelled():
++        entered.cancel()
++    else:
++        entered.set_exception(
++            task.exception() or DialogsError("Dialog fg event was not handled"),
++        )
+diff --git a/src/maxo/dialogs/manager/update_handler.py b/src/maxo/dialogs/manager/update_handler.py
+index c9adbcb9..11cae3e6 100644
+--- a/src/maxo/dialogs/manager/update_handler.py
++++ b/src/maxo/dialogs/manager/update_handler.py
+@@ -27,6 +27,9 @@ async def handle_aiogd_update(
+         await dialog_manager.switch_to(state=event.new_state)
+         await dialog_manager.show()
+     elif isinstance(event, DialogFgEvent):
++        if event.entered.done():
++            # Вызвавший fg() отменен раньше, чем событие дошло до хендлера
++            return
+         event.entered.set_result(dialog_manager)
+         await event.exited
+     elif event.action is DialogAction.UPDATE:

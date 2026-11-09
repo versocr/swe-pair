@@ -1,0 +1,419 @@
+diff --git a/doc/source/whatsnew/v3.1.0.rst b/doc/source/whatsnew/v3.1.0.rst
+index 454f9bacb8a4c..fa9ac5c8e0c09 100644
+--- a/doc/source/whatsnew/v3.1.0.rst
++++ b/doc/source/whatsnew/v3.1.0.rst
+@@ -1258,6 +1258,7 @@ Sparse
+ - Bug in ``np.std`` and ``np.var`` on a :class:`SparseArray` returning ``NaN`` when the array held missing values, inconsistently with ``np.sum`` and ``np.mean``, which skip them (:issue:`68194`)
+ - Bug in arithmetic and comparison ops between :class:`SparseDtype` data and a datetime64 or timedelta64 operand raising ``ValueError``; invalid ops now raise ``TypeError`` as the dense equivalents do, and valid ops such as multiplying integers by timedeltas now return a result instead of raising (:issue:`68466`)
+ - Bug in arithmetic and logical ops between a :class:`SparseArray` and an operand it has no common dtype with, such as an integer :class:`SparseArray` and a timedelta64 array, returning ``Sparse[object]`` instead of the dtype the dense equivalent returns; the logical ops also returned integers where the dense equivalent returns booleans (:issue:`68562`)
++- Bug in binary operations on :class:`SparseDtype` data storing values equal to the result's ``fill_value``, so indexing with a comparison result selected the wrong elements and the result reported more stored values than it holds (:issue:`45126`, :issue:`45284`)
+ - Bug in comparison and logical operators between a :class:`SparseDtype`-backed :class:`Series` and the ``pd.NA`` scalar raising ``TypeError: boolean value of NA is ambiguous`` instead of matching the non-sparse equivalent (:issue:`68579`)
+ - Bug in comparison operators between a :class:`SparseDtype`-backed :class:`Series` and a nullable ``boolean`` :class:`Series` raising ``TypeError: boolean value of NA is ambiguous``; the result now matches the non-sparse equivalent and has ``boolean`` dtype (:issue:`68586`)
+ - Bug in comparison operators between a :class:`SparseDtype`-backed :class:`Series` and a nullable integer or floating :class:`Series` silently resolving the missing values as if they were ``NaN``; the result now matches the non-sparse equivalent and has ``boolean`` dtype (:issue:`68579`)
+diff --git a/pandas/core/arrays/sparse/array.py b/pandas/core/arrays/sparse/array.py
+index 972a5d76c2a98..8542d94f2c9ba 100644
+--- a/pandas/core/arrays/sparse/array.py
++++ b/pandas/core/arrays/sparse/array.py
+@@ -445,11 +445,65 @@ def _wrap_result(
+     if is_bool_dtype(dtype):
+         # fill_value may be np.bool_
+         fill_value = bool(fill_value)
++    if sparse_index is not None:
++        # a None sparse_index means the constructor sparsifies data itself
++        data, sparse_index = _prune_fill_value(data, sparse_index, fill_value)
+     return SparseArray(
+         data, sparse_index=sparse_index, fill_value=fill_value, dtype=dtype, kind=kind
+     )
+ 
+ 
++def _differs_from_fill(values: np.ndarray, fill_value) -> np.ndarray:
++    """
++    Which of ``values`` would not densify as ``fill_value``.
++    """
++    if isna(fill_value):
++        return notna(values)
++    mask = values != fill_value
++    if values.dtype.kind == "f" and fill_value == 0:
++        # -0.0 == 0.0 but the two densify differently, so a stored signed zero
++        #  is a real point
++        mask |= np.signbit(values) != np.signbit(fill_value)
++    return mask
++
++
++def _prune_fill_value(
++    sp_values: np.ndarray, sparse_index: SparseIndex, fill_value
++) -> tuple[np.ndarray, SparseIndex]:
++    """
++    Drop stored values that densify as fill_value, so sp_index holds only real points.
++
++    GH#45126 the ops reuse an operand's sparse index or the union of both, either
++    of which can cover a position the op turned into the fill value.
++    """
++    if sp_values.dtype.kind == "c":
++        # isna() is True when either part is NaN, so it cannot decide a complex
++        #  on its own
++        mask = _differs_from_fill(sp_values.real, np.real(fill_value)) | (
++            _differs_from_fill(sp_values.imag, np.imag(fill_value))
++        )
++    elif sp_values.dtype == object:
++        if isna(fill_value):
++            # object can hold several NAs at once, and only the fill's own spelling
++            #  densifies back as the fill
++            mask = np.array(
++                [not libmissing.is_matching_na(x, fill_value) for x in sp_values],
++                dtype=bool,
++            )
++        else:
++            # 0, 0.0 and False compare equal, so use _make_sparse's type-aware check
++            mask = splib.make_mask_object_ndarray(sp_values, fill_value)
++    else:
++        mask = _differs_from_fill(sp_values, fill_value)
++
++    if mask.all():
++        return sp_values, sparse_index
++
++    kind: SparseIndexKind = "integer" if isinstance(sparse_index, IntIndex) else "block"
++    indices = sparse_index.indices[mask]
++    return sp_values[mask], make_sparse_index(sparse_index.length, indices, kind)
++
++
+ _BOOL_SPARSE_DTYPE_FALSE_FILL = SparseDtype(bool, False)
+ _BOOL_SPARSE_DTYPE_TRUE_FILL = SparseDtype(bool, True)
+ 
+diff --git a/doc/source/whatsnew/v3.1.0.rst b/doc/source/whatsnew/v3.1.0.rst
+index 540e49ac11288..53780d518585b 100644
+--- a/doc/source/whatsnew/v3.1.0.rst
++++ b/doc/source/whatsnew/v3.1.0.rst
+@@ -768,6 +768,7 @@ Datetimelike
+ - Bug in :meth:`Series.dt.to_pydatetime` not preserving the original index and name (:issue:`66443`)
+ - Bug in ``day_of_week``, :meth:`Timestamp.weekday` and :meth:`Timestamp.day_name` returning a wrong weekday, or raising ``OverflowError``, for second-resolution datetimes with a year beyond ``2**31`` (:issue:`66549`)
+ - Bug in ``day_of_year`` and ``week``, on :class:`Timestamp` as well as on :class:`DatetimeIndex` and :class:`Series`, taking the leap-year status from a wrapped year for second-resolution datetimes with a year beyond ``2**31`` (:issue:`66549`)
++- Bug in ``np.logical_and``, ``np.logical_or``, ``np.logical_xor`` and ``np.logical_not`` returning a result for datetime-like data -- including the timezone-aware, :class:`PeriodDtype`, :class:`ArrowDtype` and :class:`SparseDtype` spellings, and the corresponding scalars -- instead of raising ``TypeError``; this now also rejects a ``NaT`` scalar against an :class:`ArrowDtype` operand, which ``&`` accepts as a null (:issue:`68524`)
+ - Bug in adding a :class:`BusinessDay` offset to a :class:`DatetimeIndex` or :class:`Series` where an out-of-bounds result silently wrapped to an unrelated date, and a result landing exactly on the ``NaT`` sentinel came back as a missing value, instead of raising ``OverflowError`` (:issue:`66552`)
+ - Bug in adding a :class:`BusinessDay` offset with ``n`` of magnitude ``2**31`` or more to a :class:`DatetimeIndex` or :class:`Series` silently shifting by a wrapped number of business days, e.g. ``n=2**32`` behaving like ``n=0`` (:issue:`66549`)
+ - Bug in adding a :class:`DateOffset` to a :class:`DatetimeIndex` or :class:`Series` where a result landing exactly on the ``NaT`` sentinel came back as a missing value, and where promoting the values to the offset's finer resolution silently wrapped to an unrelated date, instead of raising as the equivalent :class:`Timedelta` operations already did (:issue:`66552`)
+diff --git a/pandas/core/arraylike.py b/pandas/core/arraylike.py
+index 5c960719210fe..1a0c90720258e 100644
+--- a/pandas/core/arraylike.py
++++ b/pandas/core/arraylike.py
+@@ -23,6 +23,7 @@
+ from pandas.core import roperator
+ from pandas.core.construction import extract_array
+ from pandas.core.ops.common import unpack_zerodim_and_defer
++from pandas.core.ops.invalid import disallow_datetimelike_logical_ufunc
+ 
+ REDUCTION_ALIASES = {
+     "maximum": "max",
+@@ -291,6 +292,8 @@ def array_ufunc(self, ufunc: np.ufunc, method: str, *inputs: Any, **kwargs: Any)
+ 
+     cls = type(self)
+ 
++    disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+     kwargs = _standardize_out_kwarg(**kwargs)
+ 
+     # for binary ops, use our custom dunder methods
+diff --git a/pandas/core/arrays/arrow/array.py b/pandas/core/arrays/arrow/array.py
+index 6b4ac2da251f4..fd57bba826b4a 100644
+--- a/pandas/core/arrays/arrow/array.py
++++ b/pandas/core/arrays/arrow/array.py
+@@ -1150,6 +1150,9 @@ def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs, **kwargs):
+                 or pa.types.is_integer(self._pa_array.type)
+             )
+         ):
++            # this branch returns without reaching ExtensionArray.__array_ufunc__
++            ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+             # GH#62506 - when distinguish_nan_and_na is True,
+             # default_array_ufunc converts to numpy via np.asarray which
+             # produces object dtype that most ufuncs can't handle.
+diff --git a/pandas/core/arrays/base.py b/pandas/core/arrays/base.py
+index cccceea3f8c1f..59cc56d688f91 100644
+--- a/pandas/core/arrays/base.py
++++ b/pandas/core/arrays/base.py
+@@ -64,6 +64,7 @@
+ from pandas.core import (
+     arraylike,
+     missing,
++    ops,
+     roperator,
+ )
+ from pandas.core.algorithms import (
+@@ -2953,6 +2954,10 @@ def round(self, decimals: int = 0) -> Self:
+         return type(self)._from_sequence(rounded, dtype=self.dtype)
+ 
+     def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs, **kwargs):
++        # the fallback at the end of this method np.asarray()s the values: M8/m8
++        #  survive to be truth-tested, the rest flatten to object
++        ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+         if any(
+             isinstance(other, (ABCSeries, ABCIndex, ABCDataFrame)) for other in inputs
+         ):
+diff --git a/pandas/core/arrays/masked.py b/pandas/core/arrays/masked.py
+index ca8c0ecb4d3e5..dcaf1bed2930b 100644
+--- a/pandas/core/arrays/masked.py
++++ b/pandas/core/arrays/masked.py
+@@ -842,6 +842,10 @@ def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs, **kwargs):
+         # For MaskedArray inputs, we apply the ufunc to ._data
+         # and mask the result.
+ 
++        # this path never reaches ExtensionArray.__array_ufunc__, and a datetimelike
++        #  scalar is not in _HANDLED_TYPES, so this has to precede that loop
++        ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+         out = kwargs.get("out", ())
+ 
+         for x in inputs + out:
+diff --git a/pandas/core/arrays/numpy_.py b/pandas/core/arrays/numpy_.py
+index 7fc3a7ddd994d..16e60d1096e69 100644
+--- a/pandas/core/arrays/numpy_.py
++++ b/pandas/core/arrays/numpy_.py
+@@ -257,6 +257,10 @@ def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs, **kwargs):
+         # https://numpy.org/doc/stable/reference/generated/numpy.lib.mixins.NDArrayOperatorsMixin.html
+         # The primary modification is not boxing scalar return values
+         # in NumpyExtensionArray, since pandas' ExtensionArrays are 1-d.
++
++        # this path never reaches ExtensionArray.__array_ufunc__
++        ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+         out = kwargs.get("out", ())
+ 
+         result = arraylike.maybe_dispatch_ufunc_to_dunder_op(
+diff --git a/pandas/core/arrays/sparse/array.py b/pandas/core/arrays/sparse/array.py
+index 53f9ec1267b46..b05b34855aa81 100644
+--- a/pandas/core/arrays/sparse/array.py
++++ b/pandas/core/arrays/sparse/array.py
+@@ -2816,6 +2816,10 @@ def argmin(self, skipna: bool = True) -> int:
+     _HANDLED_TYPES = (np.ndarray, numbers.Number)
+ 
+     def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs, **kwargs):
++        # this path never reaches ExtensionArray.__array_ufunc__, and a datetimelike
++        #  scalar is not in _HANDLED_TYPES, so this has to precede that loop
++        ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+         out = kwargs.get("out", ())
+ 
+         for x in inputs + out:
+diff --git a/pandas/core/indexes/base.py b/pandas/core/indexes/base.py
+index bb06ad48469a0..4e2e3b6f7b634 100644
+--- a/pandas/core/indexes/base.py
++++ b/pandas/core/indexes/base.py
+@@ -958,6 +958,10 @@ def __array_ufunc__(
+         if any(isinstance(other, (ABCSeries, ABCDataFrame)) for other in inputs):
+             return NotImplemented
+ 
++        # self._values only reaches the ExtensionArray guard when it is an EA, so a
++        #  bool Index against datetimelike data needs this here
++        ops.disallow_datetimelike_logical_ufunc(ufunc, inputs)
++
+         result = arraylike.maybe_dispatch_ufunc_to_dunder_op(
+             self, ufunc, method, *inputs, **kwargs
+         )
+diff --git a/pandas/core/ops/__init__.py b/pandas/core/ops/__init__.py
+index da0932c88923a..0225fbaf52304 100644
+--- a/pandas/core/ops/__init__.py
++++ b/pandas/core/ops/__init__.py
+@@ -24,6 +24,7 @@
+ )
+ from pandas.core.ops.invalid import (
+     disallow_datetimelike_logical_op,
++    disallow_datetimelike_logical_ufunc,
+     invalid_comparison,
+ )
+ from pandas.core.ops.mask_ops import (
+@@ -74,6 +75,7 @@
+     "comp_method_OBJECT_ARRAY",
+     "comparison_op",
+     "disallow_datetimelike_logical_op",
++    "disallow_datetimelike_logical_ufunc",
+     "fill_binop",
+     "get_array_op",
+     "get_op_result_name",
+diff --git a/pandas/core/ops/invalid.py b/pandas/core/ops/invalid.py
+index 76e741659f5ac..f9c698762116c 100644
+--- a/pandas/core/ops/invalid.py
++++ b/pandas/core/ops/invalid.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import datetime
+ import operator
+ from typing import (
+     TYPE_CHECKING,
+@@ -14,17 +15,28 @@
+ import numpy as np
+ 
+ from pandas._libs import lib
++from pandas._libs.missing import NAType
++from pandas._libs.tslibs import (
++    BaseOffset,
++    Period,
++)
+ 
+ from pandas.core.dtypes.dtypes import (
+     ArrowDtype,
+     CategoricalDtype,
+     PeriodDtype,
+ )
++from pandas.core.dtypes.generic import (
++    ABCDataFrame,
++    ABCExtensionArray,
++    ABCIndex,
++    ABCNumpyExtensionArray,
++    ABCSeries,
++)
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Callable
+ 
+-    from pandas._libs.missing import NAType
+     from pandas._typing import (
+         ArrayLike,
+         Scalar,
+@@ -32,6 +44,51 @@
+     )
+ 
+ 
++_LOGICAL_UFUNCS = frozenset(
++    {np.logical_and, np.logical_or, np.logical_xor, np.logical_not}
++)
++
++# Timestamp and NaT subclass datetime.date, Timedelta subclasses datetime.timedelta
++_DATETIMELIKE_SCALARS = (
++    datetime.date,
++    datetime.time,
++    datetime.timedelta,
++    np.datetime64,
++    np.timedelta64,
++    Period,
++    BaseOffset,
++)
++
++# a ufunc against one of these stays inside pandas: every _HANDLED_TYPES contains
++#  np.ndarray, NA matches no ABC (see test_logical_ufunc_na_scalar_datetimelike),
++#  and a pandas operand that one array does defer to re-enters this guard
++_NON_DEFERRING = (
++    np.ndarray,
++    ABCDataFrame,
++    ABCExtensionArray,
++    # NumpyExtensionArray's _typ is not one of ABCExtensionArray's
++    ABCNumpyExtensionArray,
++    ABCIndex,
++    ABCSeries,
++    NAType,
++)
++
++
++def _defers_to(obj: object) -> bool:
++    """
++    Whether a ufunc operand is one pandas hands the operation off to.
++    """
++    array_ufunc = getattr(type(obj), "__array_ufunc__", None)
++    return (
++        array_ufunc is not None
++        and array_ufunc is not np.ndarray.__array_ufunc__
++        # issubclass, not isinstance: the ABCs read `_typ` off whatever they are
++        #  handed, and a symbolic operand answers that with an expression that
++        #  then has no truth value, see test_logical_ufunc_symbolic_operand
++        and not issubclass(type(obj), _NON_DEFERRING)
++    )
++
++
+ def invalid_comparison(
+     left: ArrayLike,
+     right: ArrayLike | list | range | Scalar | NAType,
+@@ -71,12 +128,19 @@ def _is_datetimelike_array(obj: object) -> bool:
+     dtype = getattr(obj, "dtype", None)
+     if dtype is None:
+         return False
+-    if dtype.kind in "biufc":
+-        # no numeric or bool dtype is datetimelike, and logical_op is hot
++    return _is_datetimelike_dtype(dtype)
++
++
++def _is_datetimelike_dtype(dtype: object) -> bool:
++    kind = getattr(dtype, "kind", None)
++    if not isinstance(kind, str) or kind in "biufc":
++        # no numeric or bool dtype is datetimelike, and logical_op is hot.  A
++        #  third-party dtype may have no kind at all, or one that is not a string,
++        #  and must fall through rather than crash, see test_logical_op_third_party
+         return False
+     if isinstance(dtype, CategoricalDtype) and dtype.categories is not None:
+         # a Categorical hides its categories behind kind "O"
+-        dtype = dtype.categories.dtype
++        return _is_datetimelike_dtype(dtype.categories.dtype)
+     if isinstance(dtype, ArrowDtype):
+         import pyarrow as pa
+ 
+@@ -89,7 +153,7 @@ def _is_datetimelike_array(obj: object) -> bool:
+     # kind covers numpy M8/m8 and DatetimeTZDtype; PeriodDtype has kind "O" and needs
+     #  naming.  Plain object dtype is excluded on purpose, see
+     #  test_logical_op_object_dtype_still_truthy
+-    return dtype.kind in "mM" or isinstance(dtype, PeriodDtype)
++    return kind in "mM" or isinstance(dtype, PeriodDtype)
+ 
+ 
+ def _operand_repr(obj: object) -> str:
+@@ -126,6 +190,60 @@ def disallow_datetimelike_logical_op(
+         )
+ 
+ 
++def disallow_datetimelike_logical_ufunc(ufunc: np.ufunc, inputs: tuple) -> None:
++    """
++    Raise TypeError if a logical ufunc is applied to datetimelike data.
++
++    These are not in ``UFUNC_ALIASES`` -- they differ from ``&``/``|``/``^`` on
++    integer data -- so they never reach :func:`disallow_datetimelike_logical_op`
++    and need their own guard.  GH#68524
++
++    Parameters
++    ----------
++    ufunc : numpy.ufunc
++    inputs : tuple
++        The ufunc's operands, which may include DataFrames.
++
++    Raises
++    ------
++    TypeError : if any operand is datetimelike
++    """
++    if ufunc not in _LOGICAL_UFUNCS:
++        return
++
++    if any(_defers_to(obj) for obj in inputs):
++        # pandas defers the whole op, so raising for any operand takes it away,
++        #  see test_logical_ufunc_third_party_datetimelike
++        return
++
++    for obj in inputs:
++        if isinstance(obj, ABCDataFrame):
++            # a DataFrame has no dtype of its own, and with two inputs
++            #  array_ufunc np.asarray()s it before any column-level guard runs.
++            #  Scanned per block rather than per column: this runs on every
++            #  logical ufunc call
++            dtype = next(
++                (
++                    blk.dtype
++                    for blk in obj._mgr.blocks
++                    if _is_datetimelike_dtype(blk.dtype)
++                ),
++                None,
++            )
++            if dtype is None:
++                continue
++            descr = f"with dtype {dtype}"
++        elif _is_datetimelike_array(obj):
++            descr = f"with dtype {obj.dtype}"
++        elif isinstance(obj, _DATETIMELIKE_SCALARS):
++            # GH#68452 left scalar operands to the paths that already rejected
++            #  them for &/|/^; no such path exists on the ufunc side
++            descr = f"of type {type(obj).__name__}"
++        else:
++            continue
++        raise TypeError(f"Object {descr} cannot perform the numpy op {ufunc.__name__}")
++
++
+ def make_invalid_op(name: str) -> Callable[..., NoReturn]:
+     """
+     Return a binary method that always raises a TypeError.

@@ -1,0 +1,532 @@
+diff --git a/celery/app/amqp.py b/celery/app/amqp.py
+index 8dcec363053..6caedc5c5c6 100644
+--- a/celery/app/amqp.py
++++ b/celery/app/amqp.py
+@@ -46,6 +46,13 @@ class Queues(dict):
+         create_missing (bool): By default any unknown queues will be
+             added automatically, but if this flag is disabled the occurrence
+             of unknown queues in `wanted` will raise :exc:`KeyError`.
++        create_missing_queue_type (str): Type of queue to create for missing queues.
++            Must be either 'classic' (default) or 'quorum'. If set to 'quorum',
++            the broker will declare new queues using the quorum type.
++        create_missing_queue_exchange_type (str): Type of exchange to use
++            when creating missing queues. If not set, the default exchange type
++            will be used. If set, the exchange type will be set to this value
++            when creating missing queues.
+         max_priority (int): Default x-max-priority for queues with none set.
+     """
+ 
+@@ -53,14 +60,19 @@ class Queues(dict):
+     #: The rest of the queues are then used for routing only.
+     _consume_from = None
+ 
+-    def __init__(self, queues=None, default_exchange=None,
+-                 create_missing=True, autoexchange=None,
+-                 max_priority=None, default_routing_key=None):
++    def __init__(
++            self, queues=None, default_exchange=None,
++            create_missing=True, create_missing_queue_type=None,
++            create_missing_queue_exchange_type=None, autoexchange=None,
++            max_priority=None, default_routing_key=None,
++    ):
+         super().__init__()
+         self.aliases = WeakValueDictionary()
+         self.default_exchange = default_exchange
+         self.default_routing_key = default_routing_key
+         self.create_missing = create_missing
++        self.create_missing_queue_type = create_missing_queue_type
++        self.create_missing_queue_exchange_type = create_missing_queue_exchange_type
+         self.autoexchange = Exchange if autoexchange is None else autoexchange
+         self.max_priority = max_priority
+         if queues is not None and not isinstance(queues, Mapping):
+@@ -181,7 +193,21 @@ def deselect(self, exclude):
+                 self._consume_from.pop(queue, None)
+ 
+     def new_missing(self, name):
+-        return Queue(name, self.autoexchange(name), name)
++        queue_arguments = None
++        if self.create_missing_queue_type and self.create_missing_queue_type != "classic":
++            if self.create_missing_queue_type not in ("classic", "quorum"):
++                raise ValueError(
++                    f"Invalid queue type '{self.create_missing_queue_type}'. "
++                    "Valid types are 'classic' and 'quorum'."
++                )
++            queue_arguments = {"x-queue-type": self.create_missing_queue_type}
++
++        if self.create_missing_queue_exchange_type:
++            exchange = Exchange(name, self.create_missing_queue_exchange_type)
++        else:
++            exchange = self.autoexchange(name)
++
++        return Queue(name, exchange, name, queue_arguments=queue_arguments)
+ 
+     @property
+     def consume_from(self):
+@@ -238,14 +264,18 @@ def create_task_message(self):
+     def send_task_message(self):
+         return self._create_task_sender()
+ 
+-    def Queues(self, queues, create_missing=None,
+-               autoexchange=None, max_priority=None):
++    def Queues(self, queues, create_missing=None, create_missing_queue_type=None,
++               create_missing_queue_exchange_type=None, autoexchange=None, max_priority=None):
+         # Create new :class:`Queues` instance, using queue defaults
+         # from the current configuration.
+         conf = self.app.conf
+         default_routing_key = conf.task_default_routing_key
+         if create_missing is None:
+             create_missing = conf.task_create_missing_queues
++        if create_missing_queue_type is None:
++            create_missing_queue_type = conf.task_create_missing_queue_type
++        if create_missing_queue_exchange_type is None:
++            create_missing_queue_exchange_type = conf.task_create_missing_queue_exchange_type
+         if max_priority is None:
+             max_priority = conf.task_queue_max_priority
+         if not queues and conf.task_default_queue:
+@@ -259,8 +289,14 @@ def Queues(self, queues, create_missing=None,
+         autoexchange = (self.autoexchange if autoexchange is None
+                         else autoexchange)
+         return self.queues_cls(
+-            queues, self.default_exchange, create_missing,
+-            autoexchange, max_priority, default_routing_key,
++            queues,
++            default_exchange=self.default_exchange,
++            create_missing=create_missing,
++            create_missing_queue_type=create_missing_queue_type,
++            create_missing_queue_exchange_type=create_missing_queue_exchange_type,
++            autoexchange=autoexchange,
++            max_priority=max_priority,
++            default_routing_key=default_routing_key,
+         )
+ 
+     def Router(self, queues=None, create_missing=None):
+diff --git a/celery/app/control.py b/celery/app/control.py
+index 603d930a542..00db75d6ddf 100644
+--- a/celery/app/control.py
++++ b/celery/app/control.py
+@@ -20,7 +20,7 @@
+ from kombu.utils.functional import lazy
+ from kombu.utils.objects import cached_property
+ 
+-from celery.exceptions import DuplicateNodenameWarning
++from celery.exceptions import DuplicateNodenameWarning, ImproperlyConfigured
+ from celery.utils.log import get_logger
+ from celery.utils.text import pluralize
+ 
+@@ -428,6 +428,12 @@ class Control:
+ 
+     def __init__(self, app=None):
+         self.app = app
++        if (app.conf.control_queue_durable and
++                app.conf.control_queue_exclusive):
++            raise ImproperlyConfigured(
++                "control_queue_durable and control_queue_exclusive cannot both be True "
++                "(exclusive queues are automatically deleted and cannot be durable).",
++            )
+         self.mailbox = self.Mailbox(
+             app.conf.control_exchange,
+             type='fanout',
+@@ -437,6 +443,8 @@ def __init__(self, app=None):
+             queue_ttl=app.conf.control_queue_ttl,
+             reply_queue_ttl=app.conf.control_queue_ttl,
+             queue_expires=app.conf.control_queue_expires,
++            queue_exclusive=app.conf.control_queue_exclusive,
++            queue_durable=app.conf.control_queue_durable,
+             reply_queue_expires=app.conf.control_queue_expires,
+         )
+         register_after_fork(self, _after_fork_cleanup_control)
+diff --git a/celery/app/defaults.py b/celery/app/defaults.py
+index f8e2511fd01..bd44d8bfbbc 100644
+--- a/celery/app/defaults.py
++++ b/celery/app/defaults.py
+@@ -150,6 +150,8 @@ def __repr__(self):
+     control=Namespace(
+         queue_ttl=Option(300.0, type='float'),
+         queue_expires=Option(10.0, type='float'),
++        queue_exclusive=Option(False, type='bool'),
++        queue_durable=Option(False, type='bool'),
+         exchange=Option('celery', type='string'),
+     ),
+     couchbase=Namespace(
+@@ -179,6 +181,8 @@ def __repr__(self):
+         queue_expires=Option(60.0, type='float'),
+         queue_ttl=Option(5.0, type='float'),
+         queue_prefix=Option('celeryev'),
++        queue_exclusive=Option(False, type='bool'),
++        queue_durable=Option(False, type='bool'),
+         serializer=Option('json'),
+         exchange=Option('celeryev', type='string'),
+     ),
+@@ -260,6 +264,8 @@ def __repr__(self):
+         annotations=Option(type='any'),
+         compression=Option(type='string', old={'celery_message_compression'}),
+         create_missing_queues=Option(True, type='bool'),
++        create_missing_queue_type=Option('classic', type='string'),
++        create_missing_queue_exchange_type=Option(None, type='string'),
+         inherit_parent_priority=Option(False, type='bool'),
+         default_delivery_mode=Option(2, type='string'),
+         default_queue=Option('celery'),
+diff --git a/celery/events/receiver.py b/celery/events/receiver.py
+index 14871073322..bda50a10083 100644
+--- a/celery/events/receiver.py
++++ b/celery/events/receiver.py
+@@ -8,6 +8,7 @@
+ 
+ from celery import uuid
+ from celery.app import app_or_default
++from celery.exceptions import ImproperlyConfigured
+ from celery.utils.time import adjust_timestamp
+ 
+ from .event import get_exchange
+@@ -34,7 +35,9 @@ class EventReceiver(ConsumerMixin):
+ 
+     def __init__(self, channel, handlers=None, routing_key='#',
+                  node_id=None, app=None, queue_prefix=None,
+-                 accept=None, queue_ttl=None, queue_expires=None):
++                 accept=None, queue_ttl=None, queue_expires=None,
++                 queue_exclusive=None,
++                 queue_durable=None):
+         self.app = app_or_default(app or self.app)
+         self.channel = maybe_channel(channel)
+         self.handlers = {} if handlers is None else handlers
+@@ -48,11 +51,22 @@ def __init__(self, channel, handlers=None, routing_key='#',
+             queue_ttl = self.app.conf.event_queue_ttl
+         if queue_expires is None:
+             queue_expires = self.app.conf.event_queue_expires
++        if queue_exclusive is None:
++            queue_exclusive = self.app.conf.event_queue_exclusive
++        if queue_durable is None:
++            queue_durable = self.app.conf.event_queue_durable
++        if queue_exclusive and queue_durable:
++            raise ImproperlyConfigured(
++                'Queue cannot be both exclusive and durable, '
++                'choose one or the other.'
++            )
+         self.queue = Queue(
+             '.'.join([self.queue_prefix, self.node_id]),
+             exchange=self.exchange,
+             routing_key=self.routing_key,
+-            auto_delete=True, durable=False,
++            auto_delete=not queue_durable,
++            durable=queue_durable,
++            exclusive=queue_exclusive,
+             message_ttl=queue_ttl,
+             expires=queue_expires,
+         )
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index 26b4d64db71..0de8eba8a57 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -103,6 +103,8 @@ have been moved into a new  ``task_`` prefix.
+ ``CELERY_MONGODB_BACKEND_SETTINGS``        :setting:`mongodb_backend_settings`
+ ``CELERY_EVENT_QUEUE_EXPIRES``             :setting:`event_queue_expires`
+ ``CELERY_EVENT_QUEUE_TTL``                 :setting:`event_queue_ttl`
++``CELERY_EVENT_QUEUE_DURABLE``             :setting:`event_queue_durable`
++``CELERY_EVENT_QUEUE_EXCLUSIVE``           :setting:`event_queue_exclusive`
+ ``CELERY_EVENT_QUEUE_PREFIX``              :setting:`event_queue_prefix`
+ ``CELERY_EVENT_SERIALIZER``                :setting:`event_serializer`
+ ``CELERY_REDIS_DB``                        :setting:`redis_db`
+@@ -134,6 +136,8 @@ have been moved into a new  ``task_`` prefix.
+ ``CELERY_ANNOTATIONS``                     :setting:`task_annotations`
+ ``CELERY_COMPRESSION``                     :setting:`task_compression`
+ ``CELERY_CREATE_MISSING_QUEUES``           :setting:`task_create_missing_queues`
++``CELERY_CREATE_MISSING_QUEUE_TYPE``       :setting:`task_create_missing_queue_type`
++``CELERY_CREATE_MISSING_QUEUE_EXCHANGE_TYPE`` :setting:`task_create_missing_queue_exchange_type`
+ ``CELERY_DEFAULT_DELIVERY_MODE``           :setting:`task_default_delivery_mode`
+ ``CELERY_DEFAULT_EXCHANGE``                :setting:`task_default_exchange`
+ ``CELERY_DEFAULT_EXCHANGE_TYPE``           :setting:`task_default_exchange_type`
+@@ -2619,6 +2623,51 @@ If enabled (default), any queues specified that aren't defined in
+ :setting:`task_queues` will be automatically created. See
+ :ref:`routing-automatic`.
+ 
++.. setting:: task_create_missing_queue_type
++
++``task_create_missing_queue_type``
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++.. versionadded:: 5.6
++
++Default: ``"classic"``
++
++When Celery needs to declare a queue that doesn’t exist (i.e., when
++``task_create_missing_queues`` is enabled), this setting defines what type
++of RabbitMQ queue to create.
++
++- ``"classic"`` (default): declares a standard classic queue.
++- ``"quorum"``: declares a RabbitMQ quorum queue (adds ``x-queue-type: quorum``).
++
++.. setting:: task_create_missing_queue_exchange_type
++
++``task_create_missing_queue_exchange_type``
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++.. versionadded:: 5.6
++
++Default: ``None``
++
++If this option is None or the empty string (the default), Celery leaves the
++exchange exactly as returned by your :attr:`app.amqp.Queues.autoexchange`
++hook.
++
++You can set this to a specific exchange type, such as ``"direct"``, ``"topic"``, or
++``"fanout"``, to create the missing queue with that exchange type.
++
++.. tip::
++
++Combine this setting with task_create_missing_queue_type = "quorum"
++to create quorum queues bound to a topic exchange, for example::
++
++    app.conf.task_create_missing_queues=True
++    app.conf.task_create_missing_queue_type="quorum"
++    app.conf.task_create_missing_queue_exchange_type="topic"
++
++.. note::
++
++Like the queue-type setting above, this option does not affect queues
++that you define explicitly in :setting:`task_queues`; it applies only to
++queues created implicitly at runtime.
++
+ .. setting:: task_default_queue
+ 
+ ``task_default_queue``
+@@ -3410,6 +3459,33 @@ Default: 60.0 seconds.
+ Expiry time in seconds (int/float) for when after a monitor clients
+ event queue will be deleted (``x-expires``).
+ 
++.. setting:: event_queue_durable
++
++``event_queue_durable``
++~~~~~~~~~~~~~~~~~~~~~~~~
++:transports supported: ``amqp``
++.. versionadded:: 5.6
++
++Default: ``False``
++
++If enabled, the event receiver's queue will be marked as *durable*, meaning it will survive broker restarts.
++
++.. setting:: event_queue_exclusive
++
++``event_queue_exclusive``
++~~~~~~~~~~~~~~~~~~~~~~~~~~
++:transports supported: ``amqp``
++.. versionadded:: 5.6
++
++Default: ``False``
++
++If enabled, the event queue will be *exclusive* to the current connection and automatically deleted when the connection closes.
++
++.. warning::
++
++   You **cannot** set both ``event_queue_durable`` and ``event_queue_exclusive`` to ``True`` at the same time.
++   Celery will raise an :exc:`ImproperlyConfigured` error if both are set.
++
+ .. setting:: event_queue_prefix
+ 
+ ``event_queue_prefix``
+@@ -3566,6 +3642,31 @@ Name of the control command exchange.
+ 
+ .. _conf-logging:
+ 
++.. setting:: control_queue_durable
++
++``control_queue_durable``
++-------------------------
++
++- **Default:** ``False``
++- **Type:** ``bool``
++
++If set to ``True``, the control exchange and queue will be durable — they will survive broker restarts.
++
++.. setting:: control_queue_exclusive
++
++``control_queue_exclusive``
++---------------------------
++
++- **Default:** ``False``
++- **Type:** ``bool``
++
++If set to ``True``, the control queue will be exclusive to a single connection. This is generally not recommended in distributed environments.
++
++.. warning::
++
++   Setting both ``control_queue_durable`` and ``control_queue_exclusive`` to ``True`` is not supported and will raise an error.
++
++
+ Logging
+ -------
+ 
+diff --git a/docs/userguide/monitoring.rst b/docs/userguide/monitoring.rst
+index b542633ec9d..66cb6f00871 100644
+--- a/docs/userguide/monitoring.rst
++++ b/docs/userguide/monitoring.rst
+@@ -814,3 +814,24 @@ worker-offline
+ :signature: ``worker-offline(hostname, timestamp, freq, sw_ident, sw_ver, sw_sys)``
+ 
+ The worker has disconnected from the broker.
++
++Mailbox Configuration (Advanced)
++--------------------------------
++
++Celery uses `kombu.pidbox.Mailbox` internally to send control and broadcast commands
++to workers.
++
++.. versionadded:: Kombu 5.6.0
++
++Advanced users can configure the behavior of this mailbox by customizing how it is created.
++The following parameters are now supported by `Mailbox`:
++
++- ``durable`` (default: ``False``): If set to ``True``, the control exchanges will survive broker restarts.
++- ``exclusive`` (default: ``False``): If set to ``True``, the exchanges will be usable by only one connection.
++
++.. warning::
++
++    Setting both ``durable=True`` and ``exclusive=True`` is not permitted and will
++    raise an error, as these two options are mutually incompatible in AMQP.
++
++See :setting:`event_queue_durable` and :setting:`event_queue_exclusive` for advanced configuration.
+diff --git a/celery/app/defaults.py b/celery/app/defaults.py
+index bd44d8bfbbc..28067f0cdcd 100644
+--- a/celery/app/defaults.py
++++ b/celery/app/defaults.py
+@@ -343,6 +343,7 @@ def __repr__(self):
+         proc_alive_timeout=Option(4.0, type='float'),
+         prefetch_multiplier=Option(4, type='int'),
+         enable_prefetch_count_reduction=Option(True, type='bool'),
++        disable_prefetch=Option(False, type='bool'),
+         redirect_stdouts=Option(
+             True, type='bool', old={'celery_redirect_stdouts'},
+         ),
+diff --git a/celery/bin/worker.py b/celery/bin/worker.py
+index 0cc3d6664cc..52f09f3a83d 100644
+--- a/celery/bin/worker.py
++++ b/celery/bin/worker.py
+@@ -182,6 +182,14 @@ def detach(path, argv, logfile=None, pidfile=None, uid=None,
+               help_group="Worker Options",
+               help="Set custom prefetch multiplier value "
+                    "for this worker instance.")
++@click.option('--disable-prefetch',
++              is_flag=True,
++              default=None,
++              callback=lambda ctx, _,
++              value: ctx.obj.app.conf.worker_disable_prefetch if value is None else value,
++              cls=CeleryOption,
++              help_group="Worker Options",
++              help="Disable broker prefetching. The worker will only fetch a task when a process slot is available.")
+ @click.option('-c',
+               '--concurrency',
+               type=int,
+@@ -314,6 +322,8 @@ def worker(ctx, hostname=None, pool_cls=None, app=None, uid=None, gid=None,
+     """
+     try:
+         app = ctx.obj.app
++        if 'disable_prefetch' in kwargs and kwargs['disable_prefetch'] is not None:
++            app.conf.worker_disable_prefetch = kwargs.pop('disable_prefetch')
+         if ctx.args:
+             try:
+                 app.config_from_cmdline(ctx.args, namespace='worker')
+diff --git a/celery/worker/consumer/tasks.py b/celery/worker/consumer/tasks.py
+index 67cbfc1207f..ae7245b5b37 100644
+--- a/celery/worker/consumer/tasks.py
++++ b/celery/worker/consumer/tasks.py
+@@ -48,6 +48,22 @@ def set_prefetch_count(prefetch_count):
+             )
+         c.qos = QoS(set_prefetch_count, c.initial_prefetch_count)
+ 
++        if c.app.conf.worker_disable_prefetch:
++            from types import MethodType
++
++            from celery.worker import state
++            channel_qos = c.task_consumer.channel.qos
++            original_can_consume = channel_qos.can_consume
++
++            def can_consume(self):
++                # Prefer autoscaler's max_concurrency if set; otherwise fall back to pool size
++                limit = getattr(c.controller, "max_concurrency", None) or c.pool.num_processes
++                if len(state.reserved_requests) >= limit:
++                    return False
++                return original_can_consume()
++
++            channel_qos.can_consume = MethodType(can_consume, channel_qos)
++
+     def stop(self, c):
+         """Stop task consumer."""
+         if c.task_consumer:
+diff --git a/docs/faq.rst b/docs/faq.rst
+index cd5f3aa874d..d0946153565 100644
+--- a/docs/faq.rst
++++ b/docs/faq.rst
+@@ -788,6 +788,10 @@ to describe the task prefetching *limit*.  There's no actual prefetching involve
+ Disabling the prefetch limits is possible, but that means the worker will
+ consume as many tasks as it can, as fast as possible.
+ 
++You can use the :option:`--disable-prefetch <celery worker --disable-prefetch>`
++flag (or set :setting:`worker_disable_prefetch` to ``True``) so that a worker
++only fetches a task when one of its processes is free.
++
+ A discussion on prefetch limits, and configuration settings for a worker
+ that only reserves one task at a time is found here:
+ :ref:`optimizing-prefetch-limit`.
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index 0de8eba8a57..ff0ba40bd7d 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -3180,9 +3180,17 @@ workers, note that the first worker to start will receive four times the
+ number of messages initially. Thus the tasks may not be fairly distributed
+ to the workers.
+ 
+-To disable prefetching, set :setting:`worker_prefetch_multiplier` to 1.
+-Changing that setting to 0 will allow the worker to keep consuming
+-as many messages as it wants.
++To limit the broker to only deliver one message per process at a time,
++set :setting:`worker_prefetch_multiplier` to 1. Changing that setting to 0
++will allow the worker to keep consuming as many messages as it wants.
++
++If you need to completely disable broker prefetching while still using
++early acknowledgments, enable :setting:`worker_disable_prefetch`.
++When this option is enabled the worker only fetches a task from the broker
++when one of its processes is available.
++
++You can also enable this via the :option:`--disable-prefetch <celery worker --disable-prefetch>`
++command line flag.
+ 
+ For more on prefetching, read :ref:`optimizing-prefetch-limit`
+ 
+@@ -3190,6 +3198,20 @@ For more on prefetching, read :ref:`optimizing-prefetch-limit`
+ 
+     Tasks with ETA/countdown aren't affected by prefetch limits.
+ 
++.. setting:: worker_disable_prefetch
++
++``worker_disable_prefetch``
++~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. versionadded:: 5.6
++
++Default: ``False``.
++
++When enabled, a worker will only consume messages from the broker when it
++has an available process to execute them. This disables prefetching while
++still using early acknowledgments, ensuring that tasks are fairly
++distributed between workers.
++
+ .. setting:: worker_enable_prefetch_count_reduction
+ 
+ ``worker_enable_prefetch_count_reduction``
+diff --git a/docs/userguide/optimizing.rst b/docs/userguide/optimizing.rst
+index 72ce4dc77cb..42cfdda33ad 100644
+--- a/docs/userguide/optimizing.rst
++++ b/docs/userguide/optimizing.rst
+@@ -181,9 +181,12 @@ You can enable this behavior by using the following configuration options:
+     task_acks_late = True
+     worker_prefetch_multiplier = 1
+ 
+-If you want to disable "prefetching of tasks" without using ack_late (because
+-your tasks are not idempotent) that's impossible right now and you can join the
+-discussion here https://github.com/celery/celery/discussions/7106
++If your tasks cannot be acknowledged late you can disable broker
++prefetching by enabling :setting:`worker_disable_prefetch`. With this
++setting the worker fetches a new task only when an execution slot is
++free, preventing tasks from waiting behind long running ones on busy
++workers. This can also be set from the command line using
++:option:`--disable-prefetch <celery worker --disable-prefetch>`.
+ 
+ Memory Usage
+ ------------
